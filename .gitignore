@@ -1,0 +1,23 @@
+# Your cluster's config + active-recipe pointer are local (personal topology, IPs, usernames).
+# Start from cluster.yaml.example / cluster.yaml.single-node.example.
+/cluster.yaml
+/current
+
+# Node-local runtime state / logs are not source of truth
+.idea
+*.log
+state/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+.venv/
+venv/
+
+# Local environment / credentials (never in git)
+.env
+*.pem
+*.key

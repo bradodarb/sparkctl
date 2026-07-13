@@ -1,0 +1,30 @@
+name: qwen3-235b
+description: >
+  Qwen3-235B-A22B (NVFP4) — strong coding + agentic tool calling. MoE (22B active),
+  tensor-parallel across both GB10 nodes. Primary/first recipe: published NVFP4, vLLM-ready,
+  fits 2 nodes. (Dedicated Qwen3-Coder SKUs are 480B [too big] or 30B-A3B [fast, 1-node].)
+
+services:
+  - name: agent
+    engine: vllm
+    provider: hf                              # where to fetch weights (hf | ollama | ...)
+    model: RedHatAI/Qwen3-235B-A22B-NVFP4     # vLLM-ready NVFP4 quant of Qwen3-235B-A22B
+    served_name: qwen3
+    parallel:
+      tensor: 2
+    port: 8000
+    max_model_len: 40960                      # model's native max_position_embeddings (no YaRN configured)
+    gpu_memory_utilization: 0.85              # unified memory is shared w/ system+downloads; 0.9 overruns
+    tool_call_parser: hermes                  # Qwen3 (non-Coder) uses the hermes tool parser in vLLM
+    reasoning_parser: qwen3
+    extra_args:
+      - --load-format=safetensors
+      - --trust-remote-code
+    env:
+      VLLM_USE_FLASHINFER_MOE_FP4: "1"
+
+  - name: embeddings
+    engine: ollama
+    node: ref
+    model: nomic-embed-text
+    port: 11434

@@ -1,0 +1,20 @@
+# Boot persistence for the docker backend: bring the current recipe up at boot on the head.
+# Installed (rendered from cluster.yaml) by `sparkctl deploy --init`.
+[Unit]
+Description=sparkctl — serve the current recipe across the cluster
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User={{USER}}
+WorkingDirectory={{REMOTE}}
+ExecStart={{REMOTE}}/bin/sparkctl apply
+ExecStop={{REMOTE}}/bin/sparkctl delete services --all
+# generous: first boot after a recipe switch may warm 100GB+ of weights into page cache
+TimeoutStartSec=2400
+
+[Install]
+WantedBy=multi-user.target

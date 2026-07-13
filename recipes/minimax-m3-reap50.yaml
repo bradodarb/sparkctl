@@ -1,0 +1,32 @@
+name: minimax-m3-reap50
+description: >
+  MiniMax-M3 (NVFP4, REAP-50 expert-pruned) — frontier open agentic/coding model.
+  EXPERIMENTAL on 2 nodes: the full M3 does NOT fit; REAP-50 is required and KV headroom is tight.
+
+services:
+  - name: agent
+    engine: vllm
+    provider: hf
+    model: sparkarena/Minimax-M3-v0-NVFP4-REAP50
+    served_name: minimax-m3
+    parallel:
+      tensor: 2
+    port: 8000
+    max_model_len: 65536        # conservative — raise once KV headroom is confirmed
+    gpu_memory_utilization: 0.92
+    tool_call_parser: minimax_m3
+    reasoning_parser: minimax_m3
+    extra_args:
+      - --block-size=128
+      - --load-format=safetensors            # OOM fix: avoid GDS load path on Spark
+      - --object-store-memory=1073741824      # OOM fix: shrink Ray plasma store (~30% RAM otherwise)
+    env:
+      VLLM_USE_FLASHINFER_MOE_FP4: "1"
+      RAY_memory_monitor_refresh_ms: "0"      # OOM fix: no false OOM kills at ~96% RAM
+
+  - name: embeddings
+    engine: ollama
+    provider: ollama
+    node: ref
+    model: nomic-embed-text
+    port: 11434

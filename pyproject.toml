@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sparkctl"
+version = "0.1.0"
+description = "CLI + orchestration framework for NVIDIA DGX Spark clusters"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["pyyaml"]
+
+[project.optional-dependencies]
+server = ["fastapi", "uvicorn", "litellm[proxy]", "httpx"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+sparkctl = "sparkctl.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

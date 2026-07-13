@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Shim entrypoint: run the sparkctl package from this repo checkout (no install needed).
+Nodes execute this directly from the rsynced repo; pip-installed environments use the
+`sparkctl` console script instead."""
+import os
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+os.environ.setdefault("SPARKCTL_ROOT", str(_ROOT))
+sys.path.insert(0, str(_ROOT / "src"))
+
+from sparkctl.cli.main import main
+
+main()

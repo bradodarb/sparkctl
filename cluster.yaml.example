@@ -1,0 +1,74 @@
+# sparkctl cluster configuration — copy to cluster.yaml and edit for your cluster.
+# This file is the single source of truth: topology, deployment, server, and model distribution.
+
+cluster:
+  name: my-spark-cluster
+  head: coach                     # node that runs Ray head, the vLLM API server, and the boot daemon
+  container_image: csv-vllm:26.06-ray   # vLLM+Ray serving image (built by `sparkctl build`)
+  container_prefix: csv           # prefix for managed container names (csv-svc-*, csv-dl-*, ...)
+  model_cache: /home/you/models   # HF cache on each node — weights live here, never in git
+  api_port: 8000                  # default vLLM serving port (per-service override in recipes)
+
+# How the control machine reaches the nodes.
+deploy:
+  user: you
+  remote_path: /opt/sparkctl
+
+# Where recipes' model services run: docker (default) | k8s (roadmap).
+backend: docker
+
+# Unified server: LiteLLM gateway + metrics + dashboard in one process on one port.
+#   /v1/*     OpenAI-compatible API, routed/load-balanced over the current deployment
+#   /metrics  Prometheus exposition aggregated from every node (a single scrape target)
+#   /healthz  control-plane health          /dash  zero-dependency HTML status page
+server:
+  mode: local                     # local (plain process, no Docker — default) | docker | k8s (roadmap)
+  host: local                     # local (dev machine) | a node name — where the server runs
+  port: 8080
+  routing_strategy: simple-shuffle  # LiteLLM router strategy (e.g. least-busy)
+  # master_key: sk-...            # optional: require this key from clients
+  metrics:
+    enabled: true
+    scrape_interval_s: 10         # how often the server samples each node's vLLM /metrics
+  grafana:                        # OPTIONAL Prometheus+Grafana containers (needs Docker on server.host);
+    enabled: false                # Prometheus scrapes the unified server's /metrics as one target
+    prometheus_port: 9090
+    grafana_port: 3000
+    retention: 15d
+
+# OPTIONAL model-distribution source. Absent -> the head downloads, then fabric-mirrors to nodes.
+# With nas: configured, `sparkctl apply` checks nodes -> NAS -> download: weights already on the
+# NAS replicate from there (no re-download), and fresh downloads are archived back to the NAS.
+# nas:
+#   mode: path                    # path (NFS/SMB mount visible on the head) | ssh (rsync endpoint)
+#   path: /mnt/nas/models         # mode: path — downloads can land here directly
+#   download_to: nas              # nas | head — where fresh HF downloads go (path mode only)
+#   # host: nas.lan               # mode: ssh — nodes pull models via rsync-over-ssh
+#   # user: you
+#   # remote_path: /export/models
+
+# Robust HF downloads: xet backend disabled by default (known stalls), finite timeouts, a progress
+# watchdog that kills+resumes hangs, and sha256 verification of every shard afterwards.
+download:
+  use_xet: false
+  request_timeout: 60             # HF_HUB_DOWNLOAD_TIMEOUT (s)
+  etag_timeout: 30                # HF_HUB_ETAG_TIMEOUT (s)
+  stall_timeout: 180              # watchdog: kill+resume if cache bytes don't grow for this long
+  max_attempts: 4                 # download+verify attempts before giving up
+
+nodes:
+  coach:
+    host: spark-aaaa.local        # management LAN mDNS name
+    lan_ip: 192.168.1.10          # control machine -> node SSH/rsync (avoids mDNS stalls)
+    fabric_ip: 10.100.176.1       # high-speed fabric (NCCL / model mirroring)
+  ref:
+    host: spark-bbbb.local
+    lan_ip: 192.168.1.11
+    fabric_ip: 10.100.176.2
+    ssh_host: 10.100.176.2        # node-to-node SSH override (mDNS doesn't resolve node-to-node)
+
+# Tuned NCCL knobs for the RoCE fabric between nodes.
+fabric:
+  nccl_ib_hca: rocep1s0f0,roceP2p1s0f0
+  nccl_socket_ifname: enp1s0f0np0,enP2p1s0f0np0
+  nccl_ib_gid_index: 3

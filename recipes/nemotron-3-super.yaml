@@ -1,0 +1,31 @@
+name: nemotron-3-super
+description: >
+  NVIDIA Nemotron-3-Super-120B-A12B (NVFP4) — 120B/12B Mamba2-Transformer hybrid LatentMoE,
+  agentic + long context (to 1M). NVIDIA officially supports DGX Spark for this model.
+  Requires vLLM >= 0.20 -> pinned to the 26.06 container (0.22.1, lists "Nemotron Super V3").
+
+services:
+  - name: agent
+    engine: vllm
+    provider: hf
+    model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+    served_name: nemotron-3-super
+    node: coach                              # ~70GB NVFP4 fits ONE node (no Ray); leaves ref + downloads free
+    parallel:
+      tensor: 1                              # single-node serve
+    port: 8000
+    max_model_len: 65536                     # practical single-node context (hybrid Mamba keeps KV small; raise later if needed)
+    gpu_memory_utilization: 0.85
+    tool_call_parser: qwen3_coder
+    # NOTE: reasoning_parser super_v3 needs a plugin not present in this image — omitted until
+    # available. Minimal known-good args below; re-add mamba/cudagraph tuning once base serve works.
+    extra_args:
+      - --trust-remote-code
+      - --kv-cache-dtype=fp8
+
+  - name: embeddings
+    engine: ollama
+    provider: ollama
+    node: ref
+    model: nomic-embed-text
+    port: 11434

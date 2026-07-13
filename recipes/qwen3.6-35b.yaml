@@ -1,0 +1,38 @@
+name: qwen3.6-35b
+description: >
+  NVIDIA Qwen3.6-35B-A3B (NVFP4) — 35B/3B MoE hybrid-attention, fast agentic model. ~18GB, fits a
+  SINGLE node (TP=1), leaving the other node free for a second model. Requires newer vLLM (uses the
+  qwen3_xml parser / marlin MoE / MTP spec-decode) -> pinned to the 26.06 container (0.22.1).
+  NOTE: single-node (TP=1) serving, no Ray.
+
+services:
+  - name: agent
+    engine: vllm
+    provider: hf
+    model: nvidia/Qwen3.6-35B-A3B-NVFP4
+    served_name: qwen3.6
+    node: coach                              # single-node model
+    parallel:
+      tensor: 1
+    port: 8000
+    max_model_len: 262144
+    gpu_memory_utilization: 0.40             # card default — leaves room to co-locate
+    tool_call_parser: qwen3_xml
+    reasoning_parser: qwen3
+    extra_args:
+      - --trust-remote-code
+      - --kv-cache-dtype=fp8
+      - --attention-backend=flashinfer
+      - --moe-backend=marlin
+      - --enable-chunked-prefill
+      - --async-scheduling
+      - --enable-prefix-caching
+      - --max-num-seqs=4
+      - --max-num-batched-tokens=8192
+
+  - name: embeddings
+    engine: ollama
+    provider: ollama
+    node: ref
+    model: nomic-embed-text
+    port: 11434

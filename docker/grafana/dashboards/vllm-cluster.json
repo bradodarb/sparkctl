@@ -1,0 +1,67 @@
+{
+  "uid": "vllm-cluster",
+  "title": "vLLM Cluster (sparkctl)",
+  "tags": ["sparkctl", "vllm"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "Generation throughput (tok/s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] },
+      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "expr": "sum by (model_name) (rate(vllm:generation_tokens_total[1m]))",
+        "legendFormat": "{{model_name}}" } ]
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Prompt throughput (tok/s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] },
+      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "expr": "sum by (model_name) (rate(vllm:prompt_tokens_total[1m]))",
+        "legendFormat": "{{model_name}}" } ]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "TTFT p95 (s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "expr": "histogram_quantile(0.95, sum by (le, model_name) (rate(vllm:time_to_first_token_seconds_bucket[5m])))",
+        "legendFormat": "{{model_name}}" } ]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "KV cache usage (%)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "expr": "sum by (model_name) (vllm:gpu_cache_usage_perc)",
+        "legendFormat": "{{model_name}}" } ]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Requests running",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] },
+      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "expr": "sum by (model_name) (vllm:num_requests_running)",
+        "legendFormat": "{{model_name}}" } ]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Requests waiting (queue)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] },
+      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "expr": "sum by (model_name) (vllm:num_requests_waiting)",
+        "legendFormat": "{{model_name}}" } ]
+    }
+  ]
+}

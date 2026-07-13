@@ -1,0 +1,50 @@
+# sparkctl configuration for a SINGLE DGX Spark — copy to cluster.yaml and edit.
+# Everything still applies on one node: stable model names behind one OpenAI endpoint, verified
+# downloads, one-command model switching, metrics + dashboard, boot persistence. No fabric block
+# needed (that's inter-node NCCL for multi-node tensor parallelism).
+
+cluster:
+  name: my-spark
+  head: spark                     # the one node — runs the vLLM API and the boot daemon
+  container_image: csv-vllm:26.06-ray   # serving image (built by `sparkctl build`)
+  container_prefix: csv
+  model_cache: /home/you/models   # HF cache on the node — weights live here, never in git
+  api_port: 8000
+
+deploy:
+  user: you
+  remote_path: /opt/sparkctl
+
+backend: docker                   # docker (default) | k8s (roadmap)
+
+server:
+  mode: local                     # plain process on your dev machine, no Docker
+  host: local
+  port: 8080
+  routing_strategy: simple-shuffle
+  metrics:
+    enabled: true
+    scrape_interval_s: 10
+  grafana:
+    enabled: false
+
+# Optional NAS for weights — see cluster.yaml.example. With one node there's nothing to mirror,
+# but a NAS still saves re-downloads across recipe experiments and rebuilds.
+# nas:
+#   mode: path
+#   path: /mnt/nas/models
+#   download_to: nas
+
+download:
+  use_xet: false
+  request_timeout: 60
+  etag_timeout: 30
+  stall_timeout: 180
+  max_attempts: 4
+
+nodes:
+  spark:
+    host: spark-xxxx.local        # your Spark's mDNS name
+    lan_ip: 192.168.1.10          # control machine -> node SSH/rsync (avoids mDNS stalls)
+
+# No fabric: block — single node. Recipes must use parallel: { tensor: 1 } (or omit parallel).
