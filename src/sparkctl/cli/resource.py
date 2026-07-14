@@ -305,7 +305,7 @@ def cmd_delete(args):
 
 # ---------------------------------------------------------------- top
 TOP_GAUGES = {"vllm:num_requests_running": "RUNNING", "vllm:num_requests_waiting": "WAITING",
-              "vllm:gpu_cache_usage_perc": "KV-CACHE"}
+              "vllm:kv_cache_usage_perc": "KV-CACHE"}   # renamed from gpu_cache_usage_perc in vLLM 0.22.1
 TOP_COUNTERS = {"vllm:prompt_tokens_total": "PROMPT-TOK/S",
                 "vllm:generation_tokens_total": "GEN-TOK/S"}
 

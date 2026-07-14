@@ -182,14 +182,14 @@ def test_parse_metrics_sums_label_sets():
     text = """# HELP vllm:num_requests_running ...
 vllm:num_requests_running{model_name="a"} 2.0
 vllm:num_requests_running{model_name="b"} 3.0
-vllm:gpu_cache_usage_perc{model_name="a"} 0.42
+vllm:kv_cache_usage_perc{model_name="a"} 0.42
 vllm:generation_tokens_total{model_name="a"} 1000.0
 other_metric 99
 """
-    m = resource.parse_metrics(text, ["vllm:num_requests_running", "vllm:gpu_cache_usage_perc",
+    m = resource.parse_metrics(text, ["vllm:num_requests_running", "vllm:kv_cache_usage_perc",
                                       "vllm:generation_tokens_total"])
     assert m["vllm:num_requests_running"] == 5.0
-    assert m["vllm:gpu_cache_usage_perc"] == 0.42
+    assert m["vllm:kv_cache_usage_perc"] == 0.42
     assert m["vllm:generation_tokens_total"] == 1000.0
     assert "other_metric" not in m
 

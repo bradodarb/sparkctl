@@ -8,7 +8,8 @@ from sparkctl import remote
 from sparkctl.backends import get_backend
 
 # Headline metrics surfaced on /dash and `sparkctl top` (vLLM's native exposition names).
-HEADLINE = ["vllm:num_requests_running", "vllm:num_requests_waiting", "vllm:gpu_cache_usage_perc"]
+# NB: vLLM 0.22.1 renamed gpu_cache_usage_perc -> kv_cache_usage_perc.
+HEADLINE = ["vllm:num_requests_running", "vllm:num_requests_waiting", "vllm:kv_cache_usage_perc"]
 
 
 def scrape_targets(recipe, served_from):
@@ -192,5 +193,5 @@ class Scraper:
             rows.append({"service": t["service"], "node": t["node"], "up": res["ok"],
                          "running": g.get("vllm:num_requests_running", 0.0),
                          "waiting": g.get("vllm:num_requests_waiting", 0.0),
-                         "kv_cache": g.get("vllm:gpu_cache_usage_perc", 0.0)})
+                         "kv_cache": g.get("vllm:kv_cache_usage_perc", 0.0)})
         return rows

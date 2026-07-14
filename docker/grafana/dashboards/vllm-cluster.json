@@ -40,7 +40,7 @@
       "id": 4, "type": "timeseries", "title": "KV cache usage (%)",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
       "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" },
         "expr": "sum by (model_name) (vllm:kv_cache_usage_perc)",
         "legendFormat": "{{model_name}}" } ]

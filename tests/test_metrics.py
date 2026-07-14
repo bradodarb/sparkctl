@@ -48,7 +48,7 @@ def test_parse_gauges_sums_label_sets():
 def test_scraper_exposition_and_summaries():
     s = Scraper(scrape_targets(REPLICATED, "local"))
     s.results[(config.HEAD, "agent")] = {"ok": True, "ts": 1.0, "body":
-        'vllm:num_requests_running{m="x"} 4.0\nvllm:gpu_cache_usage_perc{m="x"} 0.5\n'}
+        'vllm:num_requests_running{m="x"} 4.0\nvllm:kv_cache_usage_perc{m="x"} 0.5\n'}
     s.results[(config.WORKER, "agent-ref")] = {"ok": False, "ts": 0.0, "body": ""}
     exp = s.exposition()
     assert f'sparkctl_target_up{{node="{config.HEAD}",service="agent"}} 1' in exp
@@ -56,6 +56,7 @@ def test_scraper_exposition_and_summaries():
     assert f'vllm:num_requests_running{{node="{config.HEAD}",service="agent",m="x"}} 4.0' in exp
     rows = {r["service"]: r for r in s.summaries()}
     assert rows["agent"]["up"] and rows["agent"]["running"] == 4.0
+    assert rows["agent"]["kv_cache"] == 0.5
     assert not rows["agent-ref"]["up"]
 
 
