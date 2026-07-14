@@ -42,7 +42,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
       "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" },
-        "expr": "sum by (model_name) (vllm:gpu_cache_usage_perc)",
+        "expr": "sum by (model_name) (vllm:kv_cache_usage_perc)",
         "legendFormat": "{{model_name}}" } ]
     },
     {
