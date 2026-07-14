@@ -29,12 +29,13 @@ def _dl_env():
 
 def hf_download_start(model, cache=None):
     """Start a detached, resumable, authenticated HF download container on HEAD. Returns its name.
-    Runs as the invoking user (cache stays user-owned for the fabric mirror). Sources the HF token
-    if present (non-interactive shells don't read ~/.bashrc) and passes it via `-e HF_TOKEN` (name
-    only — value never lands on the command line/ps/logs). Robustness env from _dl_env().
-    `cache` overrides the node cache — e.g. a NAS mount, so downloads land there directly."""
+    Runs as the invoking user (cache stays user-owned for the fabric mirror). Sources secrets
+    (`sparkctl secret set HF_TOKEN`; legacy ~/.hugging_face.sh still honored) and passes the token
+    via `-e HF_TOKEN` (name only — value never lands on the command line/ps/logs). Robustness env
+    from _dl_env(). `cache` overrides the node cache — e.g. a NAS mount, so downloads land there."""
     name = dl_cname(model)
     inner = ('[ -f "$HOME/.hugging_face.sh" ] && . "$HOME/.hugging_face.sh"; '
+             'set -a; [ -f "$HOME/.sparkctl/secrets.env" ] && . "$HOME/.sparkctl/secrets.env"; set +a; '
              f'docker rm -f {name} >/dev/null 2>&1 || true; '
              f'docker run -d --name {name} --user "$(id -u):$(id -g)" '
              f'-e HOME=/cache -e HF_HOME=/cache -e XDG_CACHE_HOME=/cache '
@@ -154,6 +155,162 @@ def model_present(node, model):
     return remote.on(node, _present_cmd(config.CACHE, model), check=False, capture=True).returncode == 0
 
 
+def _ollama_manifest(model):
+    """Relative manifest path inside the ollama store for a model ref: 'nomic-embed-text' lives
+    under registry.ollama.ai/library/, while refs with a registry path ('hf.co/org/repo:Q4')
+    keep it. Tag defaults to 'latest'."""
+    name, _, tag = model.partition(":")
+    if "/" not in name:
+        name = f"registry.ollama.ai/library/{name}"
+    return f"models/manifests/{name}/{tag or 'latest'}"
+
+
+def _ollama_ref(manifest_path):
+    """Inverse of _ollama_manifest: a path under models/manifests/ back to a model ref."""
+    parts = manifest_path.strip("/").split("/")
+    if len(parts) < 2:
+        return None
+    name, tag = "/".join(parts[:-1]), parts[-1]
+    if name.startswith("registry.ollama.ai/library/"):
+        name = name[len("registry.ollama.ai/library/"):]
+    return name if tag == "latest" else f"{name}:{tag}"
+
+
+# ---------------------------------------------------------------- inventory (what's installed where)
+def _list_hf_cmd(cache):
+    """Emit the hub-dir name of every COMPLETE model in an HF cache (populated snapshot, no partial
+    downloads) — one command per store, the inventory analogue of _present_cmd."""
+    return (f'cd {cache}/hub 2>/dev/null && for d in models--*; do '
+            f'[ -n "$(ls -A "$d/snapshots" 2>/dev/null)" ] && '
+            f'[ -z "$(find "$d" -name \'*.incomplete\' -print -quit 2>/dev/null)" ] && '
+            f'echo "$d"; done; true')
+
+
+def _hub_dir_to_model(d):
+    return d[len("models--"):].replace("--", "/")
+
+
+def _parse_hf_listing(out):
+    return {_hub_dir_to_model(line) for line in (out or "").splitlines()
+            if line.startswith("models--")}
+
+
+def list_hf_models(node):
+    return _parse_hf_listing(remote.on(node, _list_hf_cmd(config.CACHE),
+                                       check=False, capture=True).stdout)
+
+
+def list_nas_models():
+    nas = _nas()
+    if not nas:
+        return set()
+    if _nas_mode(nas) == "ssh":
+        user = nas.get("user", config.USER)
+        cmd = _list_hf_cmd(nas["remote_path"])
+        out = remote.on(config.HEAD, f"ssh -o BatchMode=yes {user}@{nas['host']} "
+                                     f"{json.dumps(cmd)}", check=False, capture=True).stdout
+    else:
+        out = remote.on(config.HEAD, _list_hf_cmd(nas["path"]), check=False, capture=True).stdout
+    return _parse_hf_listing(out)
+
+
+def list_ollama_models(node):
+    out = remote.on(node, f'cd {config.CACHE}/ollama/models/manifests 2>/dev/null && '
+                          f'find . -type f | sed "s|^\\./||"; true',
+                    check=False, capture=True).stdout or ""
+    return {r for r in (_ollama_ref(line.strip()) for line in out.splitlines() if line.strip())
+            if r}
+
+
+def _hf_precision(cfg):
+    """Human tag for a model's precision from its config.json: the quantization format when
+    quantized (NVFP4/FP8/AWQ/...), else the checkpoint dtype (BF16/FP16/...)."""
+    q = cfg.get("quantization_config") or {}
+    if q:
+        blob = json.dumps(q).lower()
+        for tag in ("nvfp4", "fp8", "fp4", "int8", "int4", "awq", "gptq"):
+            if tag in blob:
+                return tag.upper()
+        return str(q.get("quant_method", "quantized")).upper()
+    dt = str(cfg.get("torch_dtype") or cfg.get("dtype") or "").replace("torch.", "")
+    return dt.upper().replace("BFLOAT16", "BF16").replace("FLOAT16", "FP16") \
+             .replace("FLOAT32", "FP32") or "-"
+
+
+def hf_model_meta(node, model, cache=None):
+    """(size_bytes|None, precision) for an HF model read from a cache on `node`: du of the hub dir
+    + the snapshot's config.json. One ssh round-trip; (None, '-') when absent. `cache` overrides
+    the node cache — e.g. a NAS mount read from the head."""
+    hub = f"{cache or config.CACHE}/{_hub_dir(model)}"
+    out = remote.on(node, f'du -sb {hub} 2>/dev/null | cut -f1; '
+                          f'cat "$(ls -1d {hub}/snapshots/* 2>/dev/null | head -1)/config.json" '
+                          f'2>/dev/null',
+                    check=False, capture=True).stdout or ""
+    first, _, rest = out.partition("\n")
+    size = int(first.strip()) if first.strip().isdigit() else None
+    try:
+        cfg = json.loads(rest)
+    except ValueError:
+        cfg = {}
+    return size, (_hf_precision(cfg) if cfg else "-")
+
+
+def ollama_model_meta(node, model):
+    """(size_bytes|None, precision) for an ollama model from the node's store: manifest layer
+    sizes + the config blob's file_type (e.g. F16, Q4_K_M)."""
+    store = f"{config.CACHE}/ollama"
+    out = remote.on(node, f"cat {store}/{_ollama_manifest(model)} 2>/dev/null",
+                    check=False, capture=True).stdout or ""
+    try:
+        man = json.loads(out)
+    except ValueError:
+        return None, "-"
+    size = sum(layer.get("size", 0) for layer in man.get("layers", [])) or None
+    digest = (man.get("config") or {}).get("digest", "").replace(":", "-")
+    precision = "-"
+    if digest:
+        blob = remote.on(node, f"cat {store}/models/blobs/{digest} 2>/dev/null",
+                         check=False, capture=True).stdout or ""
+        try:
+            precision = json.loads(blob).get("file_type") or "-"
+        except ValueError:
+            pass
+    return size, precision
+
+
+def inventory(recipe):
+    """Everything installed anywhere — each node's HF cache, each node's ollama store, the NAS —
+    unioned with the current recipe's requirements. model -> {'services', 'source',
+    'nodes': {node: bool|None}, 'nas': bool|None}; powers `get models`."""
+    nas_cfg = _nas()
+    hf_on = {n: list_hf_models(n) for n in config.NODES}
+    ol_on = {n: list_ollama_models(n) for n in config.NODES}
+    on_nas = list_nas_models() if nas_cfg else set()
+    svc, served = {}, {}
+    for s in recipe["services"]:
+        key = (s["model"], svc_provider(s))
+        svc.setdefault(key, []).append(s["name"])
+        # the gateway alias this model answers to (ollama serves under its own model name)
+        served.setdefault(key, set()).add(s.get("served_name") or s["model"])
+    out = {}
+    for m in set().union(*hf_on.values(), on_nas, {m for (m, p) in svc if p == "hf"}):
+        out[m] = {"served": sorted(served.get((m, "hf"), ())),
+                  "services": svc.get((m, "hf"), []), "source": "hf",
+                  "nodes": {n: m in hf_on[n] for n in config.NODES},
+                  "nas": (m in on_nas) if nas_cfg else None}
+    for m in set().union(*ol_on.values(), {m for (m, p) in svc if p == "ollama"}):
+        out[m] = {"served": sorted(served.get((m, "ollama"), ())),
+                  "services": svc.get((m, "ollama"), []), "source": "ollama",
+                  "nodes": {n: m in ol_on[n] for n in config.NODES},
+                  "nas": None}
+    for (m, p), names in svc.items():               # unknown providers: listed, presence unknown
+        if p not in ("hf", "ollama"):
+            out[m] = {"served": sorted(served.get((m, p), ())), "services": names, "source": p,
+                      "nodes": {n: None for n in config.NODES}, "nas": None}
+    # current recipe's models first, then the rest of the library alphabetically
+    return dict(sorted(out.items(), key=lambda kv: (not kv[1]["services"], kv[0].lower())))
+
+
 def model_on_nas(model):
     nas = _nas()
     if not nas:
@@ -242,9 +399,10 @@ def ensure_models(recipe):
             for node in missing:
                 _replicate_verified(m, node, source="nas")
             continue
-        # nowhere yet -> download. With a mounted NAS and download_to: nas, land it there directly;
-        # otherwise download to the head (then archive a copy to the NAS if one is configured).
-        if nas and _nas_mode(nas) == "path" and nas.get("download_to", "nas") == "nas":
+        # nowhere yet -> download. A mounted NAS is always the download target (that's the point
+        # of configuring one); ssh mode can't be mounted into the download container, so it
+        # downloads to the head and archives a copy back to the NAS below.
+        if nas and _nas_mode(nas) == "path":
             print(f"[ensure] {m}: downloading to NAS ({nas['path']})")
             _pull_hf(svc, cache=nas["path"])
             for node in missing:
@@ -257,20 +415,6 @@ def ensure_models(recipe):
             _replicate_verified(m, node, source="head")
         if nas:
             push_to_nas(m)
-
-
-def presence_matrix(recipe):
-    """model -> {'services': [...], 'nodes': {node: bool}, 'nas': bool|None} — powers `get models`."""
-    out = {}
-    for svc in recipe["services"]:
-        if svc_provider(svc) != "hf":
-            continue
-        m = svc["model"]
-        if m not in out:
-            out[m] = {"services": [], "nodes": {n: model_present(n, m) for n in config.NODES},
-                      "nas": model_on_nas(m) if _nas() else None}
-        out[m]["services"].append(svc["name"])
-    return out
 
 
 def mirror_to_others(models=None):

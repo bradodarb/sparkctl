@@ -14,8 +14,8 @@ import yaml
 
 from sparkctl import config, remote
 from sparkctl.backends import get_backend
-from sparkctl.distribution import ensure_models, presence_matrix
-from sparkctl.engines.vllm import svc_cname
+from sparkctl.distribution import ensure_models, hf_model_meta, inventory, ollama_model_meta
+from sparkctl.engines.vllm import multinode_serve_alive, svc_cname
 from sparkctl.server.lifecycle import refresh_server_if_running
 from sparkctl.manifest import verify_deployment, write_active_manifest
 from sparkctl.recipes import (current_recipe, load_recipe, recipe_hash, services_by_node,
@@ -66,19 +66,36 @@ def _get_nodes(output):
     _table([h.upper() for h in headers], [[r[h] for h in headers] for r in rows])
 
 
+def _fmt_size(nbytes):
+    if not nbytes:
+        return "-"
+    gb = nbytes / 1e9
+    return f"{gb:.0f}GB" if gb >= 10 else f"{gb:.1f}GB"
+
+
 def _get_services(output):
     recipe_name = current_recipe()
     recipe = load_recipe(recipe_name)
     status_by_node = get_backend().status()
-    rows = []
+    rows, meta = [], {}
     for svc in recipe["services"]:
         node, port, cname = _svc_placement(svc)
         state = status_by_node.get(node, {}).get(cname, "not running")
-        row = {"name": svc["name"], "engine": svc["engine"], "node": node,
-               "port": port, "status": state}
+        # a multinode container is `sleep infinity` — Up says nothing about the exec'd serve
+        if svc["engine"] == "vllm" and svc_world(svc) > 1 and "Up" in state \
+                and not multinode_serve_alive(cname):
+            state += "  ⚠️ vllm serve DEAD"
+        key = (node, svc["model"])
+        if key not in meta:              # size/precision read from the serving node's store
+            probe = ollama_model_meta if svc_provider(svc) == "ollama" else hf_model_meta
+            meta[key] = probe(node, svc["model"])
+        size, precision = meta[key]
+        row = {"name": svc["name"], "served": svc.get("served_name") or svc["model"],
+               "engine": svc["engine"], "model": svc["model"],
+               "size": _fmt_size(size), "precision": precision,
+               "node": node, "port": port, "status": state}
         if output == "wide":
-            row.update({"served": svc.get("served_name", svc["model"]),
-                        "container": cname, "recipe": recipe_name})
+            row.update({"container": cname, "recipe": recipe_name})
         rows.append(row)
     if output == "json":
         print(json.dumps(rows, indent=2))
@@ -98,13 +115,28 @@ def _get_recipes(output):
 
 
 def _get_models(output):
-    matrix = presence_matrix(load_recipe(current_recipe()))
+    matrix = inventory(load_recipe(current_recipe()))
+    nas = config.CFG.get("nas") or {}
     rows = []
+    def mark(v):
+        return "-" if v is None else ("✓" if v else "✗")
+    def meta(model, info):
+        """size/precision from the first node holding the model, else a mounted NAS via the head."""
+        node = next((n for n, present in info["nodes"].items() if present), None)
+        if node and info["source"] in ("hf", "ollama"):
+            probe = ollama_model_meta if info["source"] == "ollama" else hf_model_meta
+            return probe(node, model)
+        if info["nas"] and nas.get("mode", "path") == "path":
+            return hf_model_meta(config.HEAD, model, cache=nas["path"])
+        return None, "-"
     for model, info in matrix.items():
-        row = {"model": model, "services": ",".join(info["services"])}
+        size, precision = meta(model, info)
+        row = {"model": model, "name": ",".join(info["served"]) or "-",
+               "source": info["source"], "size": _fmt_size(size),
+               "precision": precision, "services": ",".join(info["services"]) or "-"}
         for node, present in info["nodes"].items():
-            row[node] = "✓" if present else "✗"
-        row["nas"] = "-" if info["nas"] is None else ("✓" if info["nas"] else "✗")
+            row[node] = mark(present)
+        row["nas"] = mark(info["nas"])
         rows.append(row)
     if output == "json":
         print(json.dumps(rows, indent=2))
@@ -195,6 +227,49 @@ def resolve_apply_target(args):
     return args.recipe or current_recipe()
 
 
+def _wait_ready(recipe, timeout):
+    """Block until every endpoint of the deployment answers /v1/models — vLLM finishes loading
+    weights well after its container reports 'Up'. Polls every 5s with a 30s heartbeat, fails
+    FAST if a service's container dies (a crash never becomes ready), exits non-zero on timeout."""
+    backend = get_backend()
+    served_from = config.SELF or config.SERVER.get("host", "local")
+    pending = {(served, base)
+               for served, bases in backend.endpoints(recipe, served_from).items()
+               for base in bases}
+    print(f"[wait] waiting on {len(pending)} endpoint(s), timeout {timeout}s "
+          f"(big models take minutes to load)", flush=True)
+    t0, last_note = time.time(), 0.0
+    while pending:
+        for tgt in sorted(pending):
+            served, base = tgt
+            if remote.sh(f"curl -sf --max-time 3 {base}/models -o /dev/null",
+                         check=False, capture=True).returncode == 0:
+                print(f"[wait] {served} @ {base} ready ({time.time() - t0:.0f}s)", flush=True)
+                pending.discard(tgt)
+        if not pending:
+            break
+        elapsed = time.time() - t0
+        if elapsed > timeout:
+            sys.exit("[wait] TIMEOUT — still not answering: "
+                     + ", ".join(base for _, base in sorted(pending)))
+        status = backend.status()   # docker ps lists running only — a vanished container crashed
+        for svc in recipe["services"]:
+            node, _, cname = _svc_placement(svc)
+            if not status.get(node, {}).get(cname):
+                sys.exit(f"[wait] service '{svc['name']}' on {node} is no longer running — "
+                         f"check: sparkctl logs {svc['name']}")
+            if svc["engine"] == "vllm" and svc_world(svc) > 1 \
+                    and not multinode_serve_alive(cname):
+                sys.exit(f"[wait] service '{svc['name']}' crashed inside its Ray container — "
+                         f"check: sparkctl logs {svc['name']}")
+        if elapsed - last_note >= 30:
+            last_note = elapsed
+            print(f"[wait] still loading ({elapsed:.0f}s): "
+                  + ", ".join(sorted({s for s, _ in pending})), flush=True)
+        time.sleep(5)
+    print(f"[wait] deployment ready in {time.time() - t0:.0f}s ✅")
+
+
 def cmd_apply(args):
     name = resolve_apply_target(args)
     recipe = load_recipe(name)         # validate before tearing anything down
@@ -203,6 +278,8 @@ def cmd_apply(args):
     (config.ROOT / "current").write_text(name + "\n")
     print(f"current -> {name}")
     _recipe_up(name)
+    if getattr(args, "wait", False):
+        _wait_ready(recipe, getattr(args, "timeout", 1800))
 
 
 def cmd_delete(args):

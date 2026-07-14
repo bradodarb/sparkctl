@@ -13,21 +13,29 @@ RECIPE = {"services": [
 class FakeRemote:
     """Record every on() call; answer presence probes from configurable sets."""
 
-    def __init__(self, present_nodes=(), on_nas=False):
+    def __init__(self, present_nodes=(), on_nas=False, ollama_nodes=()):
         self.present_nodes = set(present_nodes)
         self.on_nas = on_nas
+        self.ollama_nodes = set(ollama_nodes)
         self.calls = []
 
     def __call__(self, node, cmd, **kw):
         self.calls.append((node, cmd))
-        rc = 0
-        if "snapshots" in cmd and "rsync" not in cmd:   # presence probe
-            if "ssh -o BatchMode" in cmd or "/mnt/nas" in cmd or "/export/" in cmd:
+        rc, stdout = 0, ""
+        nas_target = "ssh -o BatchMode" in cmd or "/mnt/nas" in cmd or "/export/" in cmd
+        if "models--*" in cmd:                          # HF inventory listing (node cache or NAS)
+            if self.on_nas if nas_target else node in self.present_nodes:
+                stdout = "models--org--M\n"
+        elif "manifests" in cmd:                        # ollama store listing
+            if node in self.ollama_nodes:
+                stdout = "registry.ollama.ai/library/nomic-embed-text/latest\n"
+        elif "snapshots" in cmd and "rsync" not in cmd:  # single-model presence probe
+            if nas_target:
                 rc = 0 if self.on_nas else 1
             else:
                 rc = 0 if node in self.present_nodes else 1
         import types
-        return types.SimpleNamespace(returncode=rc, stdout="", stderr="")
+        return types.SimpleNamespace(returncode=rc, stdout=stdout, stderr="")
 
     def cmds(self, node=None):
         return [c for n, c in self.calls if node is None or n == node]
@@ -35,8 +43,8 @@ class FakeRemote:
 
 @pytest.fixture
 def fake(monkeypatch):
-    def make(present_nodes=(), on_nas=False, nas=None):
-        fr = FakeRemote(present_nodes, on_nas)
+    def make(present_nodes=(), on_nas=False, nas=None, ollama_nodes=()):
+        fr = FakeRemote(present_nodes, on_nas, ollama_nodes)
         monkeypatch.setattr(remote, "on", fr)
         monkeypatch.setattr(distribution, "verify_model",
                             lambda node, model, delete_bad=False, cache=None: True)
@@ -84,9 +92,10 @@ def test_ensure_replicates_from_nas_ssh_mode(fake):
     assert pulls and "u@nas.lan:/export/models" in pulls[0]
 
 
-def test_ensure_downloads_to_nas_when_configured(fake, monkeypatch):
+def test_ensure_downloads_to_nas_when_mounted(fake, monkeypatch):
+    # a mounted NAS is always the download target — no opt-in attribute
     fr = fake(present_nodes=set(), on_nas=False,
-              nas={"mode": "path", "path": "/mnt/nas/models", "download_to": "nas"})
+              nas={"mode": "path", "path": "/mnt/nas/models"})
     pulled = []
     monkeypatch.setattr(distribution, "_pull_hf",
                         lambda svc, cache=None: pulled.append((svc["model"], cache)) or True)
@@ -104,13 +113,66 @@ def test_ensure_archives_fresh_download_to_nas(fake, monkeypatch):
     assert archives                                           # head copy pushed back to the NAS
 
 
-def test_presence_matrix_shape(fake):
+def test_inventory_shape(fake):
     fake(present_nodes={config.HEAD}, on_nas=True, nas={"mode": "path", "path": "/mnt/nas/models"})
-    m = distribution.presence_matrix(RECIPE)
+    m = distribution.inventory(RECIPE)
+    assert m["org/M"]["source"] == "hf"
+    assert m["org/M"]["served"] == ["m"]                      # the gateway alias
     assert m["org/M"]["nodes"][config.HEAD] is True
     assert m["org/M"]["nodes"][config.WORKER] is False
     assert m["org/M"]["nas"] is True
     assert m["org/M"]["services"] == ["agent"]
+
+
+def test_inventory_covers_every_store(fake):
+    # installed-but-unreferenced HF models AND ollama models show up, not just recipe services
+    fake(present_nodes=set(config.NODES), ollama_nodes={config.WORKER})
+    recipe = {"services": [
+        {"name": "embeddings", "engine": "ollama", "model": "nomic-embed-text",
+         "node": config.WORKER, "port": 11434}]}
+    m = distribution.inventory(recipe)
+    assert m["org/M"]["services"] == []                       # on disk, no service uses it
+    assert m["org/M"]["nodes"] == {config.HEAD: True, config.WORKER: True}
+    emb = m["nomic-embed-text"]
+    assert emb["source"] == "ollama"
+    assert emb["served"] == ["nomic-embed-text"]              # ollama alias == model ref
+    assert emb["services"] == ["embeddings"]
+    assert emb["nodes"][config.WORKER] is True
+    assert emb["nodes"][config.HEAD] is False
+    assert emb["nas"] is None                                 # no NAS flow for ollama pulls
+    # recipe-referenced models sort ahead of the unreferenced library
+    assert list(m) == ["nomic-embed-text", "org/M"]
+
+
+def test_inventory_lists_nas_only_models(fake):
+    fake(present_nodes=set(), on_nas=True, nas={"mode": "path", "path": "/mnt/nas/models"})
+    m = distribution.inventory({"services": []})
+    assert m["org/M"]["nodes"] == {config.HEAD: False, config.WORKER: False}
+    assert m["org/M"]["nas"] is True
+
+
+def test_hf_precision_tags():
+    ct_nvfp4 = {"quantization_config": {"quant_method": "compressed-tensors",
+                                        "format": "nvfp4-pack-quantized"}}
+    assert distribution._hf_precision(ct_nvfp4) == "NVFP4"
+    assert distribution._hf_precision({"quantization_config": {"quant_method": "fp8"}}) == "FP8"
+    assert distribution._hf_precision({"torch_dtype": "bfloat16"}) == "BF16"   # unquantized
+    assert distribution._hf_precision({}) == "-"
+
+
+def test_hub_dir_model_roundtrip():
+    assert distribution._hub_dir_to_model("models--RedHatAI--Qwen3-235B-A22B-NVFP4") == \
+        "RedHatAI/Qwen3-235B-A22B-NVFP4"
+
+
+def test_ollama_manifest_ref_roundtrip():
+    for ref, path in [("nomic-embed-text",
+                       "models/manifests/registry.ollama.ai/library/nomic-embed-text/latest"),
+                      ("gemma3:4b", "models/manifests/registry.ollama.ai/library/gemma3/4b"),
+                      # ollama can serve HF repos directly — the registry path carries through
+                      ("hf.co/org/repo:Q4_K_M", "models/manifests/hf.co/org/repo/Q4_K_M")]:
+        assert distribution._ollama_manifest(ref) == path
+        assert distribution._ollama_ref(path[len("models/manifests/"):]) == ref
 
 
 def test_corrupt_replica_triggers_checksum_repair(fake, monkeypatch):

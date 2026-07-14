@@ -6,8 +6,10 @@ from sparkctl import config, remote
 
 def ollama_ensure(node):
     remote.on(node, f"mkdir -p {config.CACHE}/ollama", check=False)
+    # secrets (sparkctl secret set ...) flow in via --env-file; $() expands on the node
     remote.on(node, f"docker inspect {config.PFX}-ollama >/dev/null 2>&1 || "
                     f"docker run -d --rm --gpus all --network host --name {config.PFX}-ollama "
+                    f'$(test -f "$HOME/.sparkctl/secrets.env" && echo --env-file "$HOME/.sparkctl/secrets.env") '
                     f"-v {config.CACHE}/ollama:/root/.ollama docker.io/ollama/ollama", check=False)
     time.sleep(3)
 

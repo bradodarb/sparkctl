@@ -50,6 +50,79 @@ def test_apply_deploys_then_forwards_to_head(tmp_root, monkeypatch):
     assert calls.index(("deploy",)) < calls.index(("run_head", ["apply", "r2"]))
 
 
+def test_apply_wait_flag_survives_the_forward(tmp_root, monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "deploy", lambda: None)
+    monkeypatch.setattr(main, "run_head", lambda argv: calls.append(argv))
+    monkeypatch.setattr(main, "refresh_server_if_running", lambda: None)
+    main.control_main(["apply", "r2", "--wait", "--timeout", "600"])
+    assert calls == [["apply", "r2", "--wait", "--timeout", "600"]]
+
+
+class WaitBackend:
+    def __init__(self, bases=("http://n1:8000/v1", "http://n2:8000/v1"), running=True):
+        self.bases, self.running = list(bases), running
+
+    def endpoints(self, recipe, served_from):
+        return {"m": self.bases}
+
+    def status(self):
+        if not self.running:
+            return {n: {} for n in config.NODES}
+        return {n: {f"{config.PFX}-svc-agent": "Up 2 minutes",
+                    f"{config.PFX}-ollama": "Up 2 minutes"} for n in config.NODES}
+
+
+def test_wait_ready_polls_until_every_endpoint_answers(tmp_root, monkeypatch):
+    rcs = iter([1, 0, 0])                       # round 1: n1 down, n2 up; round 2: n1 up
+    curls = []
+    monkeypatch.setattr(resource, "get_backend", lambda: WaitBackend())
+    monkeypatch.setattr(resource.remote, "sh",
+                        lambda cmd, **kw: curls.append(cmd) or SimpleNamespace(
+                            returncode=next(rcs), stdout="", stderr=""))
+    monkeypatch.setattr(resource.time, "sleep", lambda s: None)
+    resource._wait_ready({"services": []}, timeout=60)
+    assert len(curls) == 3
+    assert all("curl -sf" in c and "/models" in c for c in curls)
+
+
+def test_wait_ready_times_out(tmp_root, monkeypatch):
+    monkeypatch.setattr(resource, "get_backend", lambda: WaitBackend(bases=["http://n1:8000/v1"]))
+    monkeypatch.setattr(resource.remote, "sh",
+                        lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="", stderr=""))
+    with pytest.raises(SystemExit, match="TIMEOUT"):
+        resource._wait_ready({"services": []}, timeout=-1)   # first failed round exceeds the limit
+
+
+def test_wait_ready_fails_fast_on_dead_multinode_serve(tmp_root, monkeypatch):
+    # the Ray head container is `sleep infinity` — Up while the exec'd vllm serve is long gone
+    recipe = {"services": [{"name": "agent", "engine": "vllm", "model": "org/M",
+                            "parallel": {"tensor": 2}}]}
+    class Up(WaitBackend):
+        def status(self):
+            return {n: {f"{config.PFX}-svc-agent-head": "Up 16 minutes"} for n in config.NODES}
+    monkeypatch.setattr(resource, "get_backend", lambda: Up(bases=["http://n1:8000/v1"]))
+    monkeypatch.setattr(resource, "multinode_serve_alive", lambda cname: False)
+    monkeypatch.setattr(resource.remote, "sh",
+                        lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="", stderr=""))
+    monkeypatch.setattr(resource.time, "sleep", lambda s: None)
+    with pytest.raises(SystemExit, match="crashed inside its Ray container"):
+        resource._wait_ready(recipe, timeout=60)
+
+
+def test_wait_ready_fails_fast_when_a_service_dies(tmp_root, monkeypatch):
+    # a crashed container never becomes ready — bail with a logs hint, don't sit out the timeout
+    recipe = {"services": [{"name": "agent", "engine": "vllm", "model": "org/M",
+                            "node": config.HEAD, "parallel": {"tensor": 1}}]}
+    monkeypatch.setattr(resource, "get_backend",
+                        lambda: WaitBackend(bases=["http://n1:8000/v1"], running=False))
+    monkeypatch.setattr(resource.remote, "sh",
+                        lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="", stderr=""))
+    monkeypatch.setattr(resource.time, "sleep", lambda s: None)
+    with pytest.raises(SystemExit, match="sparkctl logs agent"):
+        resource._wait_ready(recipe, timeout=60)
+
+
 def test_apply_dash_f_copies_into_recipes(tmp_root, tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(main, "deploy", lambda: calls.append("deploy"))

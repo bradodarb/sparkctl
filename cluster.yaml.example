@@ -1,5 +1,7 @@
 # sparkctl cluster configuration — copy to cluster.yaml and edit for your cluster.
 # This file is the single source of truth: topology, deployment, server, and model distribution.
+# Secrets (HF_TOKEN etc.) never go here — `sparkctl secret set HF_TOKEN` writes them to
+# ~/.sparkctl/secrets.env (0600) and syncs the file to every node.
 
 cluster:
   name: my-spark-cluster
@@ -26,6 +28,8 @@ server:
   host: local                     # local (dev machine) | a node name — where the server runs
   port: 8080
   routing_strategy: simple-shuffle  # LiteLLM router strategy (e.g. least-busy)
+  # num_retries: 2                # retry connection errors on another replica (default 2)
+  # cooldown_time: 30             # seconds a failing upstream is benched (default 30)
   # master_key: sk-...            # optional: require this key from clients
   metrics:
     enabled: true
@@ -41,10 +45,9 @@ server:
 # NAS replicate from there (no re-download), and fresh downloads are archived back to the NAS.
 # nas:
 #   mode: path                    # path (NFS/SMB mount visible on the head) | ssh (rsync endpoint)
-#   path: /mnt/nas/models         # mode: path — downloads can land here directly
-#   download_to: nas              # nas | head — where fresh HF downloads go (path mode only)
+#   path: /mnt/nas/models         # mode: path — fresh downloads land here directly
 #   # host: nas.lan               # mode: ssh — nodes pull models via rsync-over-ssh
-#   # user: you
+#   # user: you                   #   (ssh mode downloads to the head, then archives to the NAS)
 #   # remote_path: /export/models
 
 # Robust HF downloads: xet backend disabled by default (known stalls), finite timeouts, a progress

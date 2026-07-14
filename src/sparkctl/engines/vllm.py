@@ -97,6 +97,14 @@ def vllm_up(svc):
     print(f"[vllm] launched; watch: sparkctl logs {svc['name']}")
 
 
+def multinode_serve_alive(cname):
+    """True while the exec'd `vllm serve` is running inside a Ray head container. The container
+    itself runs `sleep infinity`, so docker's Up status can't distinguish a live serve from a
+    crashed one — this can."""
+    return remote.on(config.HEAD, f"docker exec {cname} pgrep -f 'vllm serve' >/dev/null 2>&1",
+                     check=False, capture=True).returncode == 0
+
+
 def vllm_down():
     for node in config.NODES:  # remove serving containers everywhere; leave downloads (dl-*) alone
         remote.on(node, f"docker ps -aq --filter name={config.PFX}-svc- | xargs -r docker rm -f",

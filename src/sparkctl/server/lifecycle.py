@@ -8,9 +8,11 @@
 Started/stopped via `sparkctl serve` / `sparkctl serve stop` — never its own gateway/metrics
 commands; whether metrics/grafana run is declared in cluster.yaml."""
 import importlib.util
+import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import yaml
@@ -64,11 +66,34 @@ def _ensure_venv():
     return py
 
 
-def serve_start(foreground=False):
+def _wait_healthy(timeout=120):
+    """Block until /healthz reports the litellm child up AND /v1 answers."""
+    port = config.SERVER.get("port", 8080)
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        h = remote.sh(f"curl -s --max-time 3 http://localhost:{port}/healthz",
+                      check=False, capture=True)
+        try:
+            litellm_up = json.loads(h.stdout or "{}").get("litellm") == "up"
+        except ValueError:
+            litellm_up = False
+        if litellm_up and remote.sh(
+                f"curl -sf --max-time 3 http://localhost:{port}/v1/models -o /dev/null",
+                check=False, capture=True).returncode == 0:
+            print(f"[server] ready in {time.time() - t0:.0f}s ✅")
+            return
+        time.sleep(2)
+    sys.exit(f"[server] not ready after {timeout}s — check {SRV_LOG}")
+
+
+def serve_start(foreground=False, wait=False):
     mode = _mode()
     load_recipe(current_recipe())          # fail fast on a broken recipe
     if mode == "docker":
-        return _docker_up()
+        _docker_up()
+        if wait:
+            _wait_healthy()
+        return
     port = config.SERVER.get("port", 8080)
     serve_stop(quiet=True)                 # idempotent restart
     # the app supervises a litellm child — make sure the CLI exists somewhere we can find it
@@ -90,6 +115,8 @@ def serve_start(foreground=False):
     where = "local" if config.SELF is None else config.SELF
     print(f"[server] up on {where}:{port} (mode: local) — /v1 /metrics /dash /healthz")
     print(f"[server] log: {SRV_LOG}   stop: sparkctl serve stop")
+    if wait:
+        _wait_healthy()
 
 
 def serve_stop(quiet=False):
@@ -176,18 +203,18 @@ def _docker_up():
     if config.SELF is None:   # dev machine: user bridge; sidecar reachable by container name
         remote.sh(f"docker network inspect {NET} >/dev/null 2>&1 || docker network create {NET}",
                   check=False)
-        remote.sh(f"docker run -d --name {SIDECAR_NAME} --network {NET} "
+        remote.sh(f"docker run -d --restart unless-stopped --name {SIDECAR_NAME} --network {NET} "
                   f"-v {cfg_file}:/app/config.yaml {litellm_bridge.LITELLM_IMAGE} "
                   f"--config /app/config.yaml")
-        remote.sh(f"docker run -d --name {SRV_NAME} --network {NET} -p {port}:{port} "
+        remote.sh(f"docker run -d --restart unless-stopped --name {SRV_NAME} --network {NET} -p {port}:{port} "
                   f"-v {config.ROOT}:/workspace:ro -e SPARKCTL_ROOT=/workspace "
                   f"-e SPARKCTL_LITELLM_URL=http://{SIDECAR_NAME}:4000 {SRV_IMAGE}")
     else:                     # node: host networking; sidecar on loopback internal port
         internal = litellm_bridge.internal_port(settings)
-        remote.sh(f"docker run -d --name {SIDECAR_NAME} --network host "
+        remote.sh(f"docker run -d --restart unless-stopped --name {SIDECAR_NAME} --network host "
                   f"-v {cfg_file}:/app/config.yaml {litellm_bridge.LITELLM_IMAGE} "
                   f"--config /app/config.yaml --host 127.0.0.1 --port {internal}")
-        remote.sh(f"docker run -d --name {SRV_NAME} --network host "
+        remote.sh(f"docker run -d --restart unless-stopped --name {SRV_NAME} --network host "
                   f"-v {config.REMOTE}:/workspace:ro -e SPARKCTL_ROOT=/workspace "
                   f"-e SPARKCTL_LITELLM_URL=http://127.0.0.1:{internal} {SRV_IMAGE}")
     _grafana_up_if_enabled()
@@ -237,12 +264,12 @@ def _grafana_up_if_enabled():
         "options": {"path": "/var/lib/grafana/dashboards"}}]}))
     dash_src = f"{config.REMOTE if config.SELF is not None else config.ROOT}/docker/grafana/dashboards"
     remote.sh(f"docker rm -f {PROM_NAME} {GRAF_NAME} >/dev/null 2>&1 || true", check=False)
-    remote.sh(f"docker run -d --name {PROM_NAME} {net} {pmap} "
+    remote.sh(f"docker run -d --restart unless-stopped --name {PROM_NAME} {net} {pmap} "
               f"-v {d}/prometheus.yml:/etc/prometheus/prometheus.yml -v {config.PFX}-prom-data:/prometheus "
               f"{PROM_IMAGE} --config.file=/etc/prometheus/prometheus.yml "
               f"--storage.tsdb.retention.time={gr.get('retention', '15d')} "
               f"--web.listen-address=:{prom_listen}", check=False)
-    remote.sh(f"docker run -d --name {GRAF_NAME} {net} {gmap} "
+    remote.sh(f"docker run -d --restart unless-stopped --name {GRAF_NAME} {net} {gmap} "
               f"-e GF_AUTH_ANONYMOUS_ENABLED=true -e GF_AUTH_ANONYMOUS_ORG_ROLE=Admin "
               f"-e GF_SERVER_HTTP_PORT={graf_port} "
               f"-v {d}/provisioning:/etc/grafana/provisioning "
@@ -252,7 +279,8 @@ def _grafana_up_if_enabled():
 
 def cmd_serve(args):
     action = getattr(args, "action", None) or "start"
-    {"start": lambda a: serve_start(foreground=getattr(a, "foreground", False)),
+    {"start": lambda a: serve_start(foreground=getattr(a, "foreground", False),
+                                    wait=getattr(a, "wait", False)),
      "stop": lambda a: serve_stop(),
      "status": serve_status,
      "config": serve_config,

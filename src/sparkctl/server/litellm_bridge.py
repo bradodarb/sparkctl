@@ -1,13 +1,14 @@
 """LiteLLM bridge: config generation (pure) + supervision of the LiteLLM proxy as a managed
 subprocess. LiteLLM's proxy is architected to own its process, so we run it as a child bound to
 loopback and reverse-proxy /v1/* to it — a LiteLLM crash never takes down /metrics or /dash."""
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import yaml
 
-from sparkctl import config
+from sparkctl import config, secrets
 from sparkctl.backends import get_backend
 
 LITELLM_IMAGE = "ghcr.io/berriai/litellm:main-stable"
@@ -26,7 +27,12 @@ def litellm_config(recipe, served_from, settings):
                                    "api_base": base,
                                    "api_key": "none"}})
     cfg = {"model_list": model_list,
-           "router_settings": {"routing_strategy": settings.get("routing_strategy", "simple-shuffle")}}
+           "router_settings": {
+               "routing_strategy": settings.get("routing_strategy", "simple-shuffle"),
+               # a dead/still-loading upstream is retried on another deployment and cooled down,
+               # so transient connection errors don't surface as 500s while a healthy replica exists
+               "num_retries": settings.get("num_retries", 2),
+               "cooldown_time": settings.get("cooldown_time", 30)}}
     if settings.get("master_key"):
         cfg["general_settings"] = {"master_key": settings["master_key"]}
     return cfg
@@ -59,10 +65,12 @@ def _litellm_bin():
 
 
 def start_child(cfg_file, settings):
-    """Launch the LiteLLM proxy as a supervised child on loopback. Returns the Popen handle."""
+    """Launch the LiteLLM proxy as a supervised child on loopback. Returns the Popen handle.
+    Secrets (sparkctl secret set ...) merge into the child's env — upstream API keys,
+    LITELLM_MASTER_KEY, whatever the routing config references."""
     LITELLM_LOG.parent.mkdir(parents=True, exist_ok=True)
     log = open(LITELLM_LOG, "a")
     return subprocess.Popen(
         [_litellm_bin(), "--config", str(cfg_file),
          "--host", "127.0.0.1", "--port", str(internal_port(settings))],
-        stdout=log, stderr=subprocess.STDOUT)
+        stdout=log, stderr=subprocess.STDOUT, env={**os.environ, **secrets.load()})

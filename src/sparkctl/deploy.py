@@ -4,8 +4,9 @@ Replaces the old deploy.sh — node list, user, and paths all come from cluster.
 same PyYAML load as everything else (no yq, no second config parser)."""
 import base64
 import shlex
+import sys
 
-from sparkctl import config, remote
+from sparkctl import config, remote, secrets
 
 EXCLUDES = "--exclude 'state/' --exclude '*.log' --exclude '.git' --exclude '__pycache__'"
 
@@ -16,10 +17,15 @@ def deploy():
     for node in config.NODES:
         a = remote.node_addr(node)
         print(f"[deploy] {node} -> {config.USER}@{a}:{config.REMOTE}")
-        remote.sh(f"rsync -az --delete {EXCLUDES} "
-                  f"{root}/bin {root}/src {root}/recipes {root}/docker {root}/systemd "
-                  f"{root}/pyproject.toml {root}/cluster.yaml {root}/current "
-                  f"{config.USER}@{a}:{config.REMOTE}/")
+        r = remote.sh(f"rsync -az --delete {EXCLUDES} "
+                      f"{root}/bin {root}/src {root}/recipes {root}/docker {root}/systemd "
+                      f"{root}/pyproject.toml {root}/cluster.yaml {root}/current "
+                      f"{config.USER}@{a}:{config.REMOTE}/", check=False)
+        if r.returncode != 0:
+            sys.exit(f"[deploy] rsync to {node} failed (exit {r.returncode}). If {config.REMOTE} "
+                     f"doesn't exist on the node yet, provision it once with: "
+                     f"sparkctl deploy --init  (creates it with sudo and installs the boot daemon)")
+    secrets.sync_to_nodes()   # no-op when no secrets are set; keeps late-added nodes covered
 
 
 def _render_unit(name):
@@ -28,35 +34,37 @@ def _render_unit(name):
     return tpl.replace("{{REMOTE}}", config.REMOTE).replace("{{USER}}", config.USER)
 
 
-def _install_unit(node, name):
+def _unit_cmd(name):
+    """Shell fragment installing + enabling a rendered unit (values never hit argv unrendered)."""
     b64 = base64.b64encode(_render_unit(name).encode()).decode()
-    cmd = (f"echo {b64} | base64 -d | sudo tee /etc/systemd/system/{name} >/dev/null && "
-           f"sudo systemctl daemon-reload && sudo systemctl enable {name}")
-    remote.sh(f"ssh -t {config.USER}@{remote.node_addr(node)} {shlex.quote(cmd)}")
+    return (f"echo {b64} | base64 -d | sudo tee /etc/systemd/system/{name} >/dev/null && "
+            f"sudo systemctl enable {name}")
 
 
 def deploy_init():
-    """One-time provisioning: dirs, docker group, PyYAML, boot unit. Interactive — sudo on the
-    nodes may prompt for a password (hence ssh -t)."""
+    """One-time provisioning: dirs, docker group, PyYAML, boot/server units, legacy retirement —
+    ONE interactive ssh session per node, so sudo prompts at most once per node."""
+    srv_host = config.SERVER.get("host", "local")
     for node in config.NODES:
         a = remote.node_addr(node)
-        print(f"[deploy --init] provisioning {node} ({a}) — sudo may prompt for a password")
-        cmd = (f"sudo mkdir -p {config.REMOTE} && "
-               f"sudo chown -R {config.USER}:{config.USER} {config.REMOTE}; "
-               f"id -nG | tr ' ' '\\n' | grep -qx docker || sudo usermod -aG docker {config.USER}; "
-               f"python3 -c 'import yaml' 2>/dev/null || pip3 install --user --quiet pyyaml "
-               f"|| sudo apt-get install -y python3-yaml")
-        remote.sh(f"ssh -t {config.USER}@{a} {shlex.quote(cmd)}")
+        print(f"[deploy --init] provisioning {node} ({a}) — sudo may prompt once")
+        steps = [
+            f"sudo mkdir -p {config.REMOTE}",
+            f"sudo chown -R {config.USER}:{config.USER} {config.REMOTE}",
+            f"id -nG | tr ' ' '\\n' | grep -qx docker || sudo usermod -aG docker {config.USER}",
+            "python3 -c 'import yaml' 2>/dev/null || pip3 install --user --quiet pyyaml "
+            "|| sudo apt-get install -y python3-yaml",
+            # retire a pre-rename install if this cluster still has one
+            "sudo systemctl disable cluster-serve.service 2>/dev/null",
+            "sudo rm -f /etc/systemd/system/cluster-serve.service",
+            "sudo rm -rf /opt/cluster-serve",
+        ]
+        if node == config.HEAD:
+            steps.append(_unit_cmd("sparkctl.service"))
+        if node == srv_host:
+            steps.append(_unit_cmd("sparkctl-server.service"))
+        steps.append("sudo systemctl daemon-reload")
+        remote.sh(f"ssh -t {config.USER}@{a} {shlex.quote('; '.join(steps) + '; true')}",
+                  check=False)
     deploy()
-    print(f"[deploy --init] installing boot unit on {config.HEAD}")
-    _install_unit(config.HEAD, "sparkctl.service")
-    # retire the pre-rename unit if this cluster still has it
-    old = ("sudo systemctl disable cluster-serve.service 2>/dev/null; "
-           "sudo rm -f /etc/systemd/system/cluster-serve.service; sudo systemctl daemon-reload")
-    remote.sh(f"ssh -t {config.USER}@{remote.node_addr(config.HEAD)} {shlex.quote(old)}",
-              check=False)
-    srv_host = config.SERVER.get("host", "local")
-    if srv_host != "local":
-        print(f"[deploy --init] installing server unit on {srv_host}")
-        _install_unit(srv_host, "sparkctl-server.service")
     print("[deploy --init] done — check: systemctl status sparkctl (on the head)")

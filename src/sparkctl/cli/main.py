@@ -14,13 +14,15 @@ Config is the single source of truth: cluster.yaml (topology/deploy) + recipes/*
   sparkctl delete services --all | delete service <name>
   sparkctl logs <service> [-f] [--tail N] | top nodes|services | status
   sparkctl pull [recipe] | pull-queue <recipe>... | mirror
+  sparkctl secret set|unset|list [NAME [VALUE]]  # ~/.sparkctl/secrets.env, synced to nodes
   sparkctl deploy | build | test | ctx-test | current | manifest
 """
 import argparse
+import getpass
 import json
 import sys
 
-from sparkctl import config, remote
+from sparkctl import config, remote, secrets
 from sparkctl.backends import get_backend
 from sparkctl.cli import resource
 from sparkctl.deploy import deploy, deploy_init
@@ -114,6 +116,26 @@ def cmd_current(args):
     print(current_recipe())
 
 
+def cmd_secret(args):
+    """set/unset write ~/.sparkctl/secrets.env (0600) and, from the control machine, sync it to
+    every node. Values come from the arg or a hidden prompt — never from cluster.yaml."""
+    if args.action == "list":
+        names = sorted(secrets.load())
+        print("\n".join(names) if names else "(no secrets set)")
+        return
+    if not args.name:
+        sys.exit(f"sparkctl: secret {args.action} requires a NAME (e.g. HF_TOKEN)")
+    s = secrets.load()
+    if args.action == "set":
+        s[args.name] = args.value if args.value is not None else getpass.getpass(f"{args.name}: ")
+    else:
+        s.pop(args.name, None)
+    secrets.save(s)
+    print(f"[secret] {args.name} {'set' if args.action == 'set' else 'removed'} ({secrets.PATH})")
+    if config.SELF is None:
+        secrets.sync_to_nodes()
+
+
 def build_parser():
     ap = argparse.ArgumentParser(prog="sparkctl")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -130,6 +152,9 @@ def build_parser():
     p = sub.add_parser("apply", help="deploy a recipe (validate, restart services, update current)")
     p.add_argument("recipe", nargs="?")
     p.add_argument("-f", "--filename", help="recipe manifest file (copied into recipes/)")
+    p.add_argument("--wait", action="store_true",
+                   help="block until every service endpoint answers (models loaded)")
+    p.add_argument("--timeout", type=int, default=1800, help="--wait limit in seconds")
     p.set_defaults(fn=resource.cmd_apply)
     p = sub.add_parser("delete", help="tear down services")
     p.add_argument("kind", choices=["service", "services"])
@@ -154,6 +179,11 @@ def build_parser():
     sub.add_parser("mirror").set_defaults(fn=cmd_mirror)
 
     # utilities
+    p = sub.add_parser("secret", help="manage secrets (HF_TOKEN etc.) — ~/.sparkctl/secrets.env, synced to nodes")
+    p.add_argument("action", choices=["set", "unset", "list"])
+    p.add_argument("name", nargs="?")
+    p.add_argument("value", nargs="?", help="omit to be prompted without echo")
+    p.set_defaults(fn=cmd_secret)
     sub.add_parser("current").set_defaults(fn=cmd_current)
     sub.add_parser("manifest").set_defaults(fn=cmd_manifest)
     sub.add_parser("test").set_defaults(fn=cmd_test)
@@ -166,6 +196,7 @@ def build_parser():
                    default="start")
     p.add_argument("--foreground", action="store_true",
                    help="stay attached (systemd/launchd units, containers)")
+    p.add_argument("--wait", action="store_true", help="block until /v1 is answering")
     p.set_defaults(fn=cmd_serve)
     return ap
 
@@ -180,12 +211,13 @@ def build():
 
 
 def run_node(node, argv):
-    remote.sh(f"ssh {config.USER}@{remote.node_addr(node)} "
-              f"{json.dumps(f'{config.REMOTE}/bin/sparkctl ' + ' '.join(argv))}", check=False)
+    r = remote.sh(f"ssh {config.USER}@{remote.node_addr(node)} "
+                  f"{json.dumps(f'{config.REMOTE}/bin/sparkctl ' + ' '.join(argv))}", check=False)
+    return r.returncode
 
 
 def run_head(argv):
-    run_node(config.HEAD, argv)
+    return run_node(config.HEAD, argv)
 
 
 def launch_pull_queue_on_head(recipes):
@@ -197,8 +229,8 @@ def launch_pull_queue_on_head(recipes):
     print(f"[pull-queue] follow: tail ~/pull-queue.log on {config.HEAD}")
 
 
-# Read-only verbs run directly on the control machine (they SSH per node as needed) — no deploy.
-LOCAL_VERBS = ("get", "describe", "top", "current")
+# Verbs that run directly on the control machine (they SSH per node as needed) — no deploy.
+LOCAL_VERBS = ("get", "describe", "top", "current", "secret")
 # Mutating verbs push the repo to the nodes first, then run on the head.
 DEPLOY_VERBS = ("apply", "delete", "pull", "mirror", "build")
 
@@ -227,12 +259,16 @@ def control_main(argv):
         name = resource.resolve_apply_target(a)
         (config.ROOT / "current").write_text(name + "\n")
         argv = ["apply", name]
+        if a.wait:
+            argv += ["--wait", "--timeout", str(a.timeout)]
     if cmd in DEPLOY_VERBS:
         deploy()
-    run_head(argv)
+    rc = run_head(argv)
     # keep a dev-machine-local server in sync after a deployment change
     if cmd == "apply" and config.SERVER.get("host", "local") == "local":
         refresh_server_if_running()
+    if rc:                       # a failed forwarded command (e.g. apply --wait crash) must
+        sys.exit(rc)             # propagate — scripts and CI depend on the exit code
 
 
 def main():

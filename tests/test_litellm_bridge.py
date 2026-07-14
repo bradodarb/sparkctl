@@ -57,3 +57,11 @@ def test_routing_strategy_and_master_key():
     cfg = litellm_config(MULTINODE, "local", {"routing_strategy": "least-busy", "master_key": "sk-x"})
     assert cfg["router_settings"]["routing_strategy"] == "least-busy"
     assert cfg["general_settings"]["master_key"] == "sk-x"
+
+
+def test_router_retries_default_on_and_overridable():
+    # connection errors retry on another deployment instead of surfacing a 500
+    rs = litellm_config(MULTINODE, "local", {})["router_settings"]
+    assert rs["num_retries"] == 2 and rs["cooldown_time"] == 30
+    rs = litellm_config(MULTINODE, "local", {"num_retries": 0, "cooldown_time": 5})["router_settings"]
+    assert rs["num_retries"] == 0 and rs["cooldown_time"] == 5

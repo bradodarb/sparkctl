@@ -29,11 +29,11 @@ server:
     enabled: false
 
 # Optional NAS for weights — see cluster.yaml.example. With one node there's nothing to mirror,
-# but a NAS still saves re-downloads across recipe experiments and rebuilds.
+# but a NAS still saves re-downloads across recipe experiments and rebuilds (a mounted NAS is
+# always the download target).
 # nas:
 #   mode: path
 #   path: /mnt/nas/models
-#   download_to: nas
 
 download:
   use_xet: false

@@ -67,3 +67,43 @@ def test_v1_proxy_returns_502_when_upstream_down(app_env):
         r = c.get("/v1/models")
     assert r.status_code == 502
     assert "upstream unavailable" in r.text
+
+
+class FakeProc:
+    def __init__(self):
+        self.returncode = None
+        self.terminated = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def test_litellm_child_respawns_after_crash(app_env, monkeypatch):
+    import time
+
+    from sparkctl.server import app as app_mod
+    from sparkctl.server import litellm_bridge
+
+    monkeypatch.delenv("SPARKCTL_LITELLM_URL")           # manage a (fake) child
+    monkeypatch.setattr(app_mod, "SUPERVISE_POLL_S", 0.01)
+    monkeypatch.setattr(app_mod, "RESTART_BACKOFF_S", 0.01)
+    procs = []
+    monkeypatch.setattr(litellm_bridge, "write_config", lambda recipe, settings: ("cfg.yaml", {}))
+    monkeypatch.setattr(litellm_bridge, "start_child",
+                        lambda cfg, settings: procs.append(FakeProc()) or procs[-1])
+    with TestClient(create_app()) as c:
+        assert len(procs) == 1
+        assert c.get("/healthz").json()["litellm"] == "up"
+        procs[0].returncode = 1                          # child "crashes"
+        deadline = time.time() + 2
+        while len(procs) < 2 and time.time() < deadline:
+            time.sleep(0.02)
+        assert len(procs) >= 2                           # supervisor respawned it
+        assert c.get("/healthz").json()["litellm"] == "up"
+    assert procs[-1].terminated                          # shutdown still terminates the child

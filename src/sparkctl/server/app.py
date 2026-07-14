@@ -10,6 +10,7 @@ upstream (the docker sidecar sets this) to skip child management."""
 import asyncio
 import contextlib
 import os
+import time
 
 from sparkctl import config
 from sparkctl.recipes import current_recipe, load_recipe, recipe_hash, services_by_node
@@ -18,6 +19,13 @@ from sparkctl.server.metrics import NodeSampler, Scraper, scrape_targets
 
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
               "te", "trailers", "transfer-encoding", "upgrade", "content-length", "host"}
+
+# LiteLLM child supervision: poll cadence + restart backoff (doubles while crash-looping, capped;
+# resets once the child has stayed up STABLE_UPTIME_S).
+SUPERVISE_POLL_S = 3.0
+RESTART_BACKOFF_S = 2.0
+RESTART_BACKOFF_MAX_S = 60.0
+STABLE_UPTIME_S = 30.0
 
 
 def create_app():
@@ -42,19 +50,40 @@ def create_app():
     scraper = Scraper(scrape_targets(recipe, served_from) if metrics_on else [], interval)
     sampler = NodeSampler(config.NODES if metrics_on else [], config.CACHE, interval)
 
-    state = {"litellm_proc": None, "scrape_task": None, "sample_task": None}
+    state = {"litellm_proc": None, "scrape_task": None, "sample_task": None,
+             "supervise_task": None}
+
+    async def _supervise_litellm(cfg_file):
+        """Respawn a crashed LiteLLM child: capped exponential backoff while it's crash-looping,
+        reset once it has stayed up. /v1 heals on its own; /healthz shows DOWN in between."""
+        backoff, started = RESTART_BACKOFF_S, time.monotonic()
+        while True:
+            await asyncio.sleep(SUPERVISE_POLL_S)
+            proc = state["litellm_proc"]
+            if proc is None or proc.poll() is None:
+                continue
+            uptime = time.monotonic() - started
+            backoff = RESTART_BACKOFF_S if uptime >= STABLE_UPTIME_S \
+                else min(backoff * 2, RESTART_BACKOFF_MAX_S)
+            print(f"[server] litellm child exited (rc={proc.returncode}) after {uptime:.0f}s "
+                  f"— restarting in {backoff:.0f}s", flush=True)
+            await asyncio.sleep(backoff)
+            state["litellm_proc"] = litellm_bridge.start_child(cfg_file, settings)
+            started = time.monotonic()
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
         if manage_child:
             cfg_file, _ = litellm_bridge.write_config(recipe, settings)
             state["litellm_proc"] = litellm_bridge.start_child(cfg_file, settings)
+            state["supervise_task"] = asyncio.create_task(_supervise_litellm(cfg_file))
         if scraper.targets:
             state["scrape_task"] = asyncio.create_task(scraper.run())
         if sampler.nodes:
             state["sample_task"] = asyncio.create_task(sampler.run())
         yield
-        for k in ("scrape_task", "sample_task"):
+        # supervisor first — a terminated child must not be mistaken for a crash and respawned
+        for k in ("supervise_task", "scrape_task", "sample_task"):
             if state[k]:
                 state[k].cancel()
         if state["litellm_proc"]:

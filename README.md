@@ -1,15 +1,13 @@
 # sparkctl
 
 Config-driven model serving for **NVIDIA DGX Spark** — one node or a cluster (e.g. 2× GB10 +
-200G CX7 fabric). A git repo is the **source of truth**: topology (`cluster.yaml`), model recipes
-(`recipes/*.yaml`), and the active pointer (`current`) live here, deploy to the nodes, and a boot
-daemon serves whichever recipe is current. Re-spin the whole setup from git at any time.
+200G CX7 fabric).
 
 > Valuable even on a **single** Spark: stable model names, a `localhost` OpenAI endpoint decoupled
 > from topology, sha256-verified downloads, one-command model switching, and built-in metrics with
-> zero extra infrastructure.
+> optionally zero extra infrastructure.
 
-## CLI — kubectl-style resources, one tool, two contexts
+## CLI —  one tool, multiple contexts
 
 `sparkctl` auto-detects where it runs (by hostname): on your **control machine** (Mac/laptop),
 read-only verbs run locally and mutating verbs auto-deploy the repo then forward to the head over
@@ -18,13 +16,15 @@ SSH; on a **cluster node** it is the orchestrator the boot daemon and forwarded 
 ```bash
 sparkctl get nodes|services|recipes|models [-o wide|json]
 sparkctl describe node|service|recipe <name>
-sparkctl apply [recipe | -f recipe.yaml]   # ensure weights -> (re)start services -> update current
+sparkctl apply [recipe | -f recipe.yaml] [--wait]  # ensure weights -> (re)start -> update current
+                                           #   --wait blocks until every endpoint answers (loaded)
 sparkctl delete services --all             # tear everything down (delete service <name> for one)
 sparkctl logs <service> [-f] [--tail N]
 sparkctl top nodes|services               # live terminal metrics (engine + node baseline)
 sparkctl status                            # one-glance summary: drift check + API health
-sparkctl serve [stop|status|config|tunnel] # the unified server (gateway+metrics+dash)
+sparkctl serve [stop|status|config|tunnel] [--wait]  # the unified server (gateway+metrics+dash)
 sparkctl pull [recipe] | pull-queue <r>... # pre-warm weights without deploying
+sparkctl secret set|unset|list [NAME]      # HF_TOKEN etc. -> ~/.sparkctl/secrets.env, synced to nodes
 sparkctl deploy [--init] | build           # push repo to nodes | build the serving image
 sparkctl test | ctx-test | current | manifest | mirror
 ```
@@ -56,7 +56,7 @@ open http://localhost:8080/dash            # live status page
 | `/healthz` | Control-plane health |
 
 LiteLLM runs as a supervised subprocess — if it crashes, `/metrics` and `/dash` stay up (and vice
-versa). Run modes via `server.mode`: **local** (plain process, no Docker — default; deps
+versa), and the server auto-restarts it with capped backoff, so `/v1` heals on its own. Run modes via `server.mode`: **local** (plain process, no Docker — default; deps
 auto-installed into `~/.sparkctl/venv` on first run), **docker** (server container + LiteLLM
 sidecar), **k8s** (roadmap). `server.host` places it on your dev machine (`local`) or a node
 (`serve tunnel` port-forwards to it). The server restarts itself with fresh routes after `apply`.
@@ -116,13 +116,19 @@ SSH, boot persistence via systemd on the head) or **k8s** (roadmap stub; the sea
   **verify every shard** (`sha256 == blob name`, corrupt shards auto-deleted + re-fetched), then
   rsync-mirror over the fabric and re-verify — a corrupt shard can never reach a serve.
 - With a `nas:` block: weights already on the NAS **replicate instead of re-downloading** (mounted
-  path or rsync-over-ssh endpoint), fresh downloads can land on the NAS directly
-  (`download_to: nas`) or get archived back to it, and `sparkctl get models` shows the full
-  presence matrix (per-node + NAS).
+  path or rsync-over-ssh endpoint). A mounted NAS is always the download target for fresh pulls;
+  an ssh-mode NAS gets a copy archived back after the head downloads.
+- `sparkctl get models` inventories **everything installed** — each node's HF cache, each node's
+  ollama store, and the NAS — unioned with the current recipe's requirements. Columns: SOURCE
+  (`hf`/`ollama`), SIZE + PRECISION (read from the weights themselves: quantization config /
+  dtype / GGUF file type), SERVICES (current-recipe services using the model), plus per-node and
+  NAS presence. What's actively serving lives in `get services` / `status`.
 
-Authenticated when `~/.hugging_face.sh` exports `HF_TOKEN`. Weights live in
-`cluster.model_cache`, never in git. `pull-queue a b c` queues several overnight (detached on the
-head, survives your laptop sleeping).
+**Secrets** (`HF_TOKEN` for gated models, LiteLLM upstream keys, ...): `sparkctl secret set
+HF_TOKEN` prompts without echo, writes `~/.sparkctl/secrets.env` (0600), and syncs it to every
+node — never in cluster.yaml or git. Downloads, the ollama container, and the LiteLLM child all
+pick it up automatically. Weights live in `cluster.model_cache`, never in git. `pull-queue a b c`
+queues several overnight (detached on the head, survives your laptop sleeping).
 
 ## Deployment verification
 
@@ -157,7 +163,6 @@ pytest -q        # config/routing/manifest/distribution/server logic — no live
 
 ## Notes / gotchas (hard-won)
 
-- **`.local` is slow from macOS** (mDNS/IPv6 stall); use `lan_ip` in `cluster.yaml`.
 - **Fabric:** the 200G port is two bonded 100G lanes — NCCL must use **both** or you get ~half
   bandwidth (MTU 9000, GID 3; see the `fabric:` block).
 - **vLLM version:** NVFP4 compressed-tensors MoE checkpoints need vLLM ≥ 0.22 (the `26.06` image);
