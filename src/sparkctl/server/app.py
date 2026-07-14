@@ -3,7 +3,8 @@
   /v1/*     reverse proxy (streaming-aware) to the managed LiteLLM child / sidecar
   /metrics  Prometheus aggregation of every node's vLLM /metrics (single scrape target)
   /healthz  control-plane health (app + LiteLLM + per-target scrape state)
-  /dash     zero-dependency HTML status page
+  /dash     zero-dependency HTML status page (gauges, polls /dash/data every second)
+  /dash/data  JSON backing the /dash live poll
 
 LiteLLM runs as a supervised subprocess by default; set SPARKCTL_LITELLM_URL to an existing
 upstream (the docker sidecar sets this) to skip child management."""
@@ -112,13 +113,24 @@ def create_app():
     async def metrics():
         return PlainTextResponse(scraper.exposition() + sampler.exposition())
 
-    @app.get("/dash")
-    async def dashboard():
+    def _dash_state():
         models = sorted({s["served_name"]
                          for svcs in services_by_node(recipe).values() for s in svcs})
-        return HTMLResponse(dash.render(recipe_name, recipe_hash(recipe_name), scraper.summaries(),
-                                        sampler.summaries(), models, _litellm_ok(),
-                                        settings.get("port", 8080)))
+        return {"recipe_name": recipe_name, "recipe_sha": recipe_hash(recipe_name),
+                "rows": scraper.summaries(), "node_rows": sampler.summaries(),
+                "models": models, "litellm_ok": _litellm_ok(),
+                "port": settings.get("port", 8080)}
+
+    @app.get("/dash")
+    async def dashboard():
+        s = _dash_state()
+        return HTMLResponse(dash.render(s["recipe_name"], s["recipe_sha"], s["rows"],
+                                        s["node_rows"], s["models"], s["litellm_ok"], s["port"]))
+
+    @app.get("/dash/data")
+    async def dashboard_data():
+        """JSON backing /dash's 1s client-side poll — same fields dash.render() consumes."""
+        return _dash_state()
 
     @app.get("/")
     async def index():
