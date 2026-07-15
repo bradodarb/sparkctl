@@ -10,6 +10,7 @@ Config is the single source of truth: cluster.yaml (topology/deploy) + recipes/*
 
   sparkctl get nodes|services|recipes [-o wide|json]
   sparkctl describe node|service|recipe <name>
+  sparkctl create recipe                        # interactive wizard -> recipes/<name>.yaml
   sparkctl apply [recipe | -f recipe.yaml]      # ensure + (re)start a deployment
   sparkctl delete services --all | delete service <name>
   sparkctl logs <service> [-f] [--tail N] | top nodes|services | status
@@ -25,6 +26,7 @@ import sys
 from sparkctl import config, remote, secrets
 from sparkctl.backends import get_backend
 from sparkctl.cli import resource
+from sparkctl.cli.create import cmd_create
 from sparkctl.deploy import deploy, deploy_init
 from sparkctl.distribution import mirror_to_others
 from sparkctl.manifest import verify_deployment, write_active_manifest
@@ -149,6 +151,9 @@ def build_parser():
     p.add_argument("kind", choices=["node", "service", "recipe"])
     p.add_argument("name")
     p.set_defaults(fn=resource.cmd_describe)
+    p = sub.add_parser("create", help="author a new recipe (interactive wizard, sane defaults)")
+    p.add_argument("kind", choices=["recipe"])
+    p.set_defaults(fn=cmd_create)
     p = sub.add_parser("apply", help="deploy a recipe (validate, restart services, update current)")
     p.add_argument("recipe", nargs="?")
     p.add_argument("-f", "--filename", help="recipe manifest file (copied into recipes/)")
@@ -230,7 +235,8 @@ def launch_pull_queue_on_head(recipes):
 
 
 # Verbs that run directly on the control machine (they SSH per node as needed) — no deploy.
-LOCAL_VERBS = ("get", "describe", "top", "current", "secret")
+# `create` only writes into the repo's recipes/ — purely local, never touches the nodes.
+LOCAL_VERBS = ("get", "describe", "top", "current", "secret", "create")
 # Mutating verbs push the repo to the nodes first, then run on the head.
 DEPLOY_VERBS = ("apply", "delete", "pull", "mirror", "build")
 

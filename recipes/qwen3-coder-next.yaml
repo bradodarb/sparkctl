@@ -20,9 +20,10 @@ services:
     tool_call_parser: qwen3_coder
     # non-thinking model — no reasoning parser
     extra_args:
-      - --trust-remote-code
-      - --load-format=safetensors
-
+#      - --trust-remote-code
+#      - --load-format=safetensors
+       - --load-format=fastsafetensors
+       - --trust-remote-code
   - name: embeddings
     engine: ollama
     provider: ollama

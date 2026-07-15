@@ -1,0 +1,185 @@
+"""`sparkctl create recipe` — an interactive wizard that writes recipes/<name>.yaml with sane,
+DGX-Spark-tuned defaults.
+
+Model-family presets fill in the fiddly, easy-to-get-wrong bits (tool/reasoning parsers, weight
+load strategy); anything unrecognized falls back to plain prompts. `detect_preset` and
+`build_recipe` are pure (no config, no I/O) so they're unit-testable and scriptable — the
+interactive shell (`cmd_create`) is a thin layer over them.
+"""
+import sys
+
+import yaml
+
+
+# ---------------------------------------------------------------- model-family presets
+def detect_preset(model):
+    """Map an HF repo id to family-specific serving defaults. Only the bits that differ per family
+    live here; TP-aware and common defaults are applied in build_recipe."""
+    m = (model or "").lower()
+    if "gpt-oss" in m or "gpt_oss" in m:
+        # gpt-oss serves via the built-in harmony format — setting a tool/reasoning parser is
+        # unnecessary and risks an 'invalid parser' crash. Leave both unset.
+        return {"family": "gpt-oss", "tool_call_parser": None, "reasoning_parser": None,
+                "trust_remote_code": False,
+                "note": "harmony format is built in — no tool/reasoning parser needed"}
+    if "qwen" in m and "coder" in m:
+        return {"family": "qwen3-coder", "tool_call_parser": "qwen3_coder",
+                "reasoning_parser": None, "trust_remote_code": True}
+    if "qwen3" in m or "qwen-3" in m:
+        return {"family": "qwen3", "tool_call_parser": "hermes", "reasoning_parser": "qwen3",
+                "trust_remote_code": True}
+    if "minimax" in m:
+        # minimax_m3 parser needs vLLM>=0.24 (not in the 26.06 image); leave unset by default.
+        return {"family": "minimax", "tool_call_parser": None, "reasoning_parser": None,
+                "trust_remote_code": True,
+                "note": "M3 parsers need vLLM>=0.24 — not in the 26.06 image; left unset"}
+    return {"family": "generic", "tool_call_parser": None, "reasoning_parser": None,
+            "trust_remote_code": False}
+
+
+# ---------------------------------------------------------------- pure recipe builder
+def build_recipe(*, name, model, engine="vllm", served_name=None, tensor=1, node=None, port=None,
+                 max_model_len=32768, gpu_memory_utilization=0.85, tool_call_parser=None,
+                 reasoning_parser=None, trust_remote_code=False, description=None, embeddings=None):
+    """Assemble a recipe dict from explicit inputs. `embeddings`, if given, is
+    {model, node, port} for an ollama embeddings service. Pure: no config access, no I/O."""
+    if engine == "ollama":
+        svc = {"name": "agent", "engine": "ollama", "provider": "ollama",
+               "node": node, "model": model, "port": port or 11434}
+        services = [svc]
+    else:
+        svc = {"name": "agent", "engine": engine, "provider": "hf", "model": model,
+               "served_name": served_name or name}
+        if tensor and tensor > 1:
+            svc["parallel"] = {"tensor": tensor}
+        elif node:
+            svc["node"] = node
+        svc["port"] = port or 8000
+        svc["max_model_len"] = max_model_len
+        svc["gpu_memory_utilization"] = gpu_memory_utilization
+        if tool_call_parser:
+            svc["tool_call_parser"] = tool_call_parser
+        if reasoning_parser:
+            svc["reasoning_parser"] = reasoning_parser
+
+        extra = []
+        if trust_remote_code:
+            extra.append("--trust-remote-code")
+        # DGX Spark mmap loading is pathologically slow. TP>=2 -> fastsafetensors (auto-nogds
+        # avoids the GDS/cuFile OOM path); single-node -> plain safetensors + eager (no mmap,
+        # no GDS init) since fastsafetensors only auto-disables GDS when TP>1.
+        if tensor and tensor > 1:
+            extra.append("--load-format=fastsafetensors")
+        else:
+            extra += ["--load-format=safetensors", "--safetensors-load-strategy=eager"]
+        svc["extra_args"] = extra
+
+        env = {}
+        if "nvfp4" in (model or "").lower():
+            env["VLLM_USE_FLASHINFER_MOE_FP4"] = "1"
+        if tensor and tensor > 1:
+            # Unified memory: weights+KV count as system RAM, so Ray's ~95% memory monitor
+            # spuriously OOM-kills TP workers at load/KV setup. Disable it.
+            env["RAY_memory_monitor_refresh_ms"] = "0"
+        if env:
+            svc["env"] = env
+        services = [svc]
+
+    if embeddings:
+        services.append({"name": "embeddings", "engine": "ollama", "provider": "ollama",
+                         "node": embeddings.get("node"), "model": embeddings["model"],
+                         "port": embeddings.get("port", 11434)})
+
+    recipe = {"name": name}
+    if description:
+        recipe["description"] = description
+    recipe["services"] = services
+    return recipe
+
+
+def to_yaml(recipe):
+    """Render a recipe dict to YAML with a short provenance header."""
+    header = ("# Generated by `sparkctl create recipe` — edit freely.\n"
+              "# DGX Spark defaults baked in: fast (no-mmap) weight loading; for multinode\n"
+              "# (tensor>=2) RAY_memory_monitor_refresh_ms=0 avoids spurious Ray OOM kills.\n")
+    body = yaml.safe_dump(recipe, sort_keys=False, default_flow_style=False, width=100)
+    return header + body
+
+
+# ---------------------------------------------------------------- interactive wizard
+def _ask(prompt, default=None):
+    suffix = f" [{default}]" if default not in (None, "") else ""
+    try:
+        val = input(f"{prompt}{suffix}: ").strip()
+    except EOFError:
+        val = ""
+    return val or (default if default is not None else "")
+
+
+def _ask_bool(prompt, default=False):
+    val = _ask(f"{prompt} ({'Y/n' if default else 'y/N'})", "").lower()
+    return default if not val else val in ("y", "yes")
+
+
+def cmd_create(args):
+    """Interactive recipe author. Runs on the control machine; writes into recipes/."""
+    from sparkctl import config   # lazy: keep the pure builders above config-free (testable)
+
+    if args.kind != "recipe":
+        sys.exit(f"create: unknown kind '{args.kind}' (only 'recipe' is supported)")
+    print("sparkctl recipe wizard — press Enter to accept [defaults].\n")
+
+    name = _ask("Recipe name (-> recipes/<name>.yaml)")
+    if not name:
+        sys.exit("create: a recipe name is required")
+    engine = _ask("Engine (vllm|ollama)", "vllm")
+    model = _ask("Model (HF repo, e.g. openai/gpt-oss-20b)" if engine == "vllm"
+                 else "Model (ollama name, e.g. nomic-embed-text)")
+    if not model:
+        sys.exit("create: a model is required")
+
+    preset = detect_preset(model)
+    note = f" — {preset['note']}" if preset.get("note") else ""
+    print(f"  detected family: {preset['family']}{note}\n")
+
+    served = tensor = node = port = mml = gpu = tcp = rp = None
+    if engine == "vllm":
+        served = _ask("Served name (API model id)", name)
+        tensor = int(_ask("Tensor-parallel size (1=single node, 2=both nodes)", "1"))
+        if tensor <= 1:
+            node = _ask("Node to pin (single-node)", config.HEAD)
+        port = int(_ask("Port", "8000"))
+        mml = int(_ask("max_model_len", "32768"))
+        gpu = float(_ask("gpu_memory_utilization", "0.85"))
+        tcp = _ask("tool_call_parser (blank = none)", preset.get("tool_call_parser") or "") or None
+        rp = _ask("reasoning_parser (blank = none)", preset.get("reasoning_parser") or "") or None
+    else:
+        node = _ask("Node to run on", config.WORKER or config.HEAD)
+        port = int(_ask("Port", "11434"))
+
+    desc = _ask("Description (optional)", "") or None
+    emb = None
+    if engine == "vllm" and _ask_bool("Add an ollama embeddings service (nomic-embed-text)?", False):
+        emb = {"model": "nomic-embed-text", "node": config.WORKER or config.HEAD, "port": 11434}
+
+    recipe = build_recipe(name=name, model=model, engine=engine, served_name=served,
+                          tensor=tensor or 1, node=node, port=port, max_model_len=mml or 32768,
+                          gpu_memory_utilization=gpu if gpu is not None else 0.85,
+                          tool_call_parser=tcp, reasoning_parser=rp,
+                          trust_remote_code=preset.get("trust_remote_code", False),
+                          description=desc, embeddings=emb)
+    text = to_yaml(recipe)
+    print(f"\n--- recipes/{name}.yaml ---\n{text}")
+    if not _ask_bool("Write this file?", True):
+        print("aborted (nothing written).")
+        return
+    dst = config.ROOT / "recipes" / f"{name}.yaml"
+    if dst.exists() and not _ask_bool(f"{dst} already exists — overwrite?", False):
+        print("aborted (nothing written).")
+        return
+    dst.write_text(text)
+    print(f"[create] wrote {dst}\n")
+    print("next steps:")
+    print(f"  sparkctl pull {name}                 # download weights (verified)")
+    print(f"  sparkctl pull-queue {name}           # ...or detached on the head (survives sleep)")
+    print(f"  sparkctl apply {name} --wait         # serve it + set current")

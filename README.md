@@ -16,6 +16,7 @@ SSH; on a **cluster node** it is the orchestrator the boot daemon and forwarded 
 ```bash
 sparkctl get nodes|services|recipes|models [-o wide|json]
 sparkctl describe node|service|recipe <name>
+sparkctl create recipe                     # interactive wizard: writes recipes/<name>.yaml (sane defaults)
 sparkctl apply [recipe | -f recipe.yaml] [--wait]  # ensure weights -> (re)start -> update current
                                            #   --wait blocks until every endpoint answers (loaded)
 sparkctl delete services --all             # tear everything down (delete service <name> for one)
