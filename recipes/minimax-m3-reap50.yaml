@@ -19,7 +19,9 @@ services:
     extra_args:
       - --block-size=128
       - --load-format=safetensors            # OOM fix: avoid GDS load path on Spark
-      - --object-store-memory=1073741824      # OOM fix: shrink Ray plasma store (~30% RAM otherwise)
+      # NOTE: Ray plasma store is shrunk by sparkctl on the `ray start` commands
+      # (engines/vllm.py). Do NOT add --object-store-memory here: it's a Ray flag,
+      # not a `vllm serve` flag, and vllm exits with "unrecognized arguments".
     env:
       VLLM_USE_FLASHINFER_MOE_FP4: "1"
       RAY_memory_monitor_refresh_ms: "0"      # OOM fix: no false OOM kills at ~96% RAM

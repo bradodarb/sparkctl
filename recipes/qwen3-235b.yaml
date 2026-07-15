@@ -18,10 +18,18 @@ services:
     tool_call_parser: hermes                  # Qwen3 (non-Coder) uses the hermes tool parser in vLLM
     reasoning_parser: qwen3
     extra_args:
-      - --load-format=safetensors
+      # fastsafetensors: DGX Spark mmap is pathologically slow (NVIDIA forum t/349886);
+      # fastsafetensors auto-uses nogds for TP>1, so it avoids the GDS/cuFile OOM path the
+      # old --load-format=safetensors was dodging. Fallback if it misbehaves for a model:
+      #   --load-format=safetensors + --safetensors-load-strategy=eager  (also disables mmap)
+      - --load-format=fastsafetensors
       - --trust-remote-code
     env:
       VLLM_USE_FLASHINFER_MOE_FP4: "1"
+      # On GB10 unified memory, weights+KV count as system RAM, so Ray's default ~95% memory
+      # monitor spuriously kills TP workers at load/KV setup (raylet: "killed due to memory
+      # pressure (OOM)"). Disable it — same OOM fix the minimax-m3 recipe uses.
+      RAY_memory_monitor_refresh_ms: "0"
 
   - name: embeddings
     engine: ollama

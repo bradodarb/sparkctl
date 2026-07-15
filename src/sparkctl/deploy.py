@@ -54,6 +54,10 @@ def deploy_init():
             f"id -nG | tr ' ' '\\n' | grep -qx docker || sudo usermod -aG docker {config.USER}",
             "python3 -c 'import yaml' 2>/dev/null || pip3 install --user --quiet pyyaml "
             "|| sudo apt-get install -y python3-yaml",
+            # headless serving node: boot to multi-user (no desktop) to free unified memory
+            # and keep gdm from starting — GB10 shares system+GPU RAM, every GB counts.
+            "sudo systemctl set-default multi-user.target",
+            "sudo systemctl mask gdm.service 2>/dev/null || true",
             # retire a pre-rename install if this cluster still has one
             "sudo systemctl disable cluster-serve.service 2>/dev/null",
             "sudo rm -f /etc/systemd/system/cluster-serve.service",
