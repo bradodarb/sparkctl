@@ -15,6 +15,9 @@ deploy:
   user: you
   remote_path: /opt/sparkctl
 
+# Editor for `sparkctl edit cluster|recipe`. Overridden by $SPARKCTL_EDITOR / $VISUAL / $EDITOR.
+# editor: nano
+
 backend: docker                   # docker (default) | k8s (roadmap)
 
 server:

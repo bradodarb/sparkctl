@@ -199,3 +199,137 @@ def test_dl_env_robustness(monkeypatch):
     assert "HF_HUB_DISABLE_XET=1" in e                       # xet off by default (known stall bug)
     monkeypatch.setattr(config, "DL", {"use_xet": True})
     assert "HF_HUB_DISABLE_XET" not in distribution._dl_env()  # opt back into xet
+
+
+# ---- progress display: human sizes, repo total, and the watchdog progress line ----
+def test_human_and_dur_formatting():
+    assert distribution._human(0) == "0B"
+    assert distribution._human(1536) == "1.5KB"
+    assert distribution._human(2 * 1024**3) == "2.0GB"
+    assert distribution._fmt_dur(0) == "0s"
+    assert distribution._fmt_dur(65) == "1m05s"
+    assert distribution._fmt_dur(3661) == "1h01m"
+
+
+def test_hf_repo_size_sums_lfs_then_size(monkeypatch):
+    import json as _json
+    import types as _t
+    listing = _json.dumps([
+        {"path": "model.safetensors", "size": 42, "lfs": {"size": 1000}},  # lfs wins over size
+        {"path": "config.json", "size": 500},                              # plain size
+        {"path": "extra.bin", "lfs": {"size": 2000}},
+    ])
+    monkeypatch.setattr(distribution.remote, "on",
+                        lambda node, cmd, **kw: _t.SimpleNamespace(stdout=listing, returncode=0, stderr=""))
+    assert distribution.hf_repo_size("org/M") == 1000 + 500 + 2000
+
+
+def test_hf_repo_size_none_on_garbage(monkeypatch):
+    import types as _t
+    monkeypatch.setattr(distribution.remote, "on",
+                        lambda node, cmd, **kw: _t.SimpleNamespace(stdout="404 not found", returncode=0, stderr=""))
+    assert distribution.hf_repo_size("org/M") is None
+
+
+def test_watchdog_prints_percent_progress_then_exits(monkeypatch, capsys):
+    import types as _t
+    states = iter(["running", "running", "exited"])
+    sizes = iter(["1073741824", "2147483648"])              # 1GB then 2GB downloaded
+
+    def fake_on(node, cmd, **kw):
+        if "State.Status" in cmd:
+            return _t.SimpleNamespace(stdout=next(states) + "\n", returncode=0, stderr="")
+        if "du -sb" in cmd:
+            return _t.SimpleNamespace(stdout=next(sizes, "2147483648") + "\n", returncode=0, stderr="")
+        return _t.SimpleNamespace(stdout="", returncode=0, stderr="")
+
+    monkeypatch.setattr(distribution.remote, "on", fake_on)
+    monkeypatch.setattr(distribution.time, "sleep", lambda s: None)
+    rc = distribution._wait_with_watchdog("dl", "org/M", total=4 * 1024**3)   # 4GB total
+    assert rc == "exited"
+    out = capsys.readouterr().out
+    assert "1.0GB/4.0GB (25%)" in out
+    assert "2.0GB/4.0GB (50%)" in out
+
+
+def test_watchdog_size_only_when_total_unknown(monkeypatch, capsys):
+    import types as _t
+    states = iter(["running", "exited"])
+
+    def fake_on(node, cmd, **kw):
+        if "State.Status" in cmd:
+            return _t.SimpleNamespace(stdout=next(states) + "\n", returncode=0, stderr="")
+        if "du -sb" in cmd:
+            return _t.SimpleNamespace(stdout="524288000\n", returncode=0, stderr="")   # 500MB
+        return _t.SimpleNamespace(stdout="", returncode=0, stderr="")
+
+    monkeypatch.setattr(distribution.remote, "on", fake_on)
+    monkeypatch.setattr(distribution.time, "sleep", lambda s: None)
+    distribution._wait_with_watchdog("dl", "org/M", total=None)
+    out = capsys.readouterr().out
+    assert "500.0MB downloaded" in out and "%" not in out
+
+
+def test_replicate_model_uses_progress2(monkeypatch):
+    calls = []
+    monkeypatch.setattr(distribution.remote, "on",
+                        lambda node, cmd, **kw: calls.append(cmd) or __import__("types").SimpleNamespace(
+                            stdout="", returncode=0, stderr=""))
+    monkeypatch.delitem(config.CFG, "nas", raising=False)
+    distribution.replicate_model("org/M", config.WORKER, source="head")
+    assert any("--info=progress2" in c for c in calls)       # node replication shows progress
+
+
+def test_dl_env_xet_high_performance(monkeypatch):
+    monkeypatch.setattr(config, "DL", {"use_xet": True})
+    e = distribution._dl_env()
+    assert "HF_XET_HIGH_PERFORMANCE=1" in e          # fast path when xet is opted into
+    assert "HF_HUB_DISABLE_XET" not in e
+
+
+def test_download_start_logs_auth_and_opt_in_workers(monkeypatch):
+    import types as _t
+    monkeypatch.setattr(config, "DL", {"use_xet": False, "max_workers": 8})
+    sent = {}
+    monkeypatch.setattr(distribution.remote, "on",
+                        lambda node, cmd, **kw: sent.update(cmd=cmd) or
+                        _t.SimpleNamespace(stdout="", returncode=0, stderr=""))
+    name = distribution.hf_download_start("org/M")
+    assert name == distribution.dl_cname("org/M")
+    assert "HF auth:" in sent["cmd"]                 # auth visibility echo
+    assert "${HF_TOKEN:+-e HF_TOKEN}" in sent["cmd"]  # token passed by name only when present
+    assert "--max-workers 8" in sent["cmd"]
+
+
+def test_download_start_no_workers_flag_by_default(monkeypatch):
+    import types as _t
+    monkeypatch.setattr(config, "DL", {"use_xet": False})
+    sent = {}
+    monkeypatch.setattr(distribution.remote, "on",
+                        lambda node, cmd, **kw: sent.update(cmd=cmd) or
+                        _t.SimpleNamespace(stdout="", returncode=0, stderr=""))
+    distribution.hf_download_start("org/M")
+    assert "--max-workers" not in sent["cmd"]        # opt-in only
+
+
+def test_prune_model_cache_is_safe_and_targeted(monkeypatch):
+    import base64 as _b64, types as _t
+    cmds = []
+    monkeypatch.setattr(distribution.remote, "on",
+                        lambda node, cmd, **k: cmds.append((node, cmd)) or
+                        _t.SimpleNamespace(returncode=0, stdout="", stderr=""))
+    distribution.prune_model_cache("org/M")
+    assert len(cmds) == len(config.NODES)                       # runs on every node
+    script = _b64.b64decode(cmds[0][1].split("echo ", 1)[1].split(" |", 1)[0]).decode()
+    assert "models--org--M" in script                          # targets the right hub dir
+    assert '*.incomplete' in script                            # clears stale partials
+    assert '[ -s "$ref" ]' in script                           # refuses to delete blobs w/o live refs
+    assert 'blobs/' in script and 'snapshots' in script
+
+
+def test_ensure_auto_prunes_recipe_models(fake, monkeypatch):
+    fr = fake(present_nodes=set(config.NODES))                 # present everywhere -> still prunes
+    pruned = []
+    monkeypatch.setattr(distribution, "prune_model_cache", lambda m, **k: pruned.append(m))
+    distribution.ensure_models(RECIPE)
+    assert pruned == ["org/M"]                                 # auto-prune ran for the hf model

@@ -1,32 +1,29 @@
 name: qwen3-coder-next
-description: >
-  Qwen3-Coder-Next (FP8) — 80B/3B MoE (Gated DeltaNet + Attention), coding + agentic tool calling,
-  non-thinking. FP8 (~80GB), tensor-parallel across both nodes. Runs on the DEFAULT container
+description: 'Qwen3-Coder-Next (FP8) — 80B/3B MoE (Gated DeltaNet + Attention), coding + agentic tool
+  calling, non-thinking. FP8 (~80GB), tensor-parallel across both nodes. Runs on the DEFAULT container
   (vLLM 0.15.1 meets the >=0.15.0 requirement) — no image pin needed.
 
+  '
 services:
-  - name: agent
-    engine: vllm
-    provider: hf
-    model: Qwen/Qwen3-Coder-Next-FP8
-    served_name: qwen3-coder-next
-    parallel:
-      tensor: 2
-    port: 8000
-    max_model_len: 131072          # card notes: drop to 32768 if KV OOM
-    gpu_memory_utilization: 0.80   # 0.90 fails the startup free-memory check; 0.85 passed
-                                   # profiling but NVRM OOM'd allocating the 59GiB KV cache
-                                   # (unified memory: weights + KV + page cache + head services)
-    tool_call_parser: qwen3_coder
-    # non-thinking model — no reasoning parser
-    extra_args:
-#      - --trust-remote-code
-#      - --load-format=safetensors
-       - --load-format=fastsafetensors
-       - --trust-remote-code
-  - name: embeddings
-    engine: ollama
-    provider: ollama
-    node: ref
-    model: nomic-embed-text
-    port: 11434
+- name: agent
+  engine: vllm
+  provider: hf
+  model: Qwen/Qwen3-Coder-Next-FP8
+  served_name: qwen3-coder-next
+  parallel:
+    tensor: 2
+  port: 8000
+  max_model_len: 131072
+  gpu_memory_utilization: 0.8
+  tool_call_parser: qwen3_coder
+  extra_args:
+  - --load-format=fastsafetensors
+  - --trust-remote-code
+  env:
+    RAY_memory_monitor_refresh_ms: '0'
+- name: embeddings
+  engine: ollama
+  provider: ollama
+  node: ref
+  model: nomic-embed-text
+  port: 11434

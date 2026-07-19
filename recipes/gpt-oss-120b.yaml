@@ -2,21 +2,25 @@
 # DGX Spark defaults baked in: fast (no-mmap) weight loading; for multinode
 # (tensor>=2) RAY_memory_monitor_refresh_ms=0 avoids spurious Ray OOM kills.
 name: gpt-oss-120b
-description: OpenAI gpt-oss-120b (MXFP4, harmony format). ~63GB weights fit one GB10 node (TP=1, no fabric
-  latency, no Ray OOM monitor). Switch to parallel.tensor=2 if you need more KV.
+description: OpenAI gpt-oss-120b (MXFP4, harmony format). Tensor-parallel across both GB10 nodes
+  (TP=2) for extra KV headroom; fits one node at parallel.tensor=1 if you'd rather skip the fabric.
 services:
 - name: agent
   engine: vllm
   provider: hf
   model: openai/gpt-oss-120b
   served_name: gpt-oss-120b
-  node: coach
+  parallel:
+    tensor: 2
   port: 8000
   max_model_len: 32768
   gpu_memory_utilization: 0.85
   extra_args:
-  - --load-format=safetensors
-  - --safetensors-load-strategy=eager
+  - --load-format=fastsafetensors
+  env:
+    # Unified memory: weights+KV count as system RAM, so Ray's ~95% memory monitor spuriously
+    # OOM-kills TP workers at load/KV setup. Disable it for multinode (tensor>=2).
+    RAY_memory_monitor_refresh_ms: "0"
 - name: embeddings
   engine: ollama
   provider: ollama

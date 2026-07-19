@@ -3,6 +3,7 @@
 kubectl-style grammar over the cluster's nouns — nodes, services, recipes. `apply` is the one
 mutating verb for deployments: validate -> tear down -> repoint `current` -> bring up -> manifest.
 """
+import base64
 import json
 import shutil
 import sys
@@ -196,12 +197,49 @@ def cmd_describe(args):
     {"node": _describe_node, "service": _describe_service, "recipe": _describe_recipe}[args.kind](args.name)
 
 
+# ---------------------------------------------------------------- boot arm/disarm state
+# Two head-local markers under {STATE} gate the systemd boot apply (`sparkctl apply --boot`):
+#   paused        — present => boot serves NOTHING (disarmed). Set by `stop` or a self-heal.
+#   boot_attempt  — a recipe name written *before* load and cleared only once the deployment is
+#                   confirmed healthy. If a boot finds it still set, the previous boot started that
+#                   recipe and never became healthy (it OOM'd/crashed the node) — so we auto-disarm
+#                   instead of retrying the same killer recipe forever.
+PAUSED, BOOT_ATTEMPT = "paused", "boot_attempt"
+
+
+def _state_write(name, content=""):
+    b64 = base64.b64encode(content.encode()).decode()
+    remote.on(config.HEAD, f"mkdir -p {config.STATE} && echo {b64} | base64 -d > {config.STATE}/{name}",
+              check=False)
+
+
+def _state_read(name):
+    r = remote.on(config.HEAD, f"cat {config.STATE}/{name} 2>/dev/null", capture=True, check=False)
+    return (r.stdout or "").strip() if r.returncode == 0 else None
+
+
+def _state_clear(name):
+    remote.on(config.HEAD, f"rm -f {config.STATE}/{name}", check=False)
+
+
 # ---------------------------------------------------------------- apply / delete
 def _services_down():
     get_backend().down()
     for node in config.NODES:   # clear the active manifest — nothing is deployed anymore
         remote.on(node, f"rm -f {config.STATE}/active.json", check=False)
     print("all services stopped")
+
+
+def _free_page_cache():
+    """Best-effort: flush clean page cache on every node right before a load, so vLLM sees real RAM
+    headroom and keeps weight-prefetch enabled. vLLM disables prefetch when the checkpoint exceeds
+    ~90% of *available* RAM — and the download/verify/mirror we just ran leaves the weights hot in
+    page cache, starving the loader (58GB gemma load went from prefetched to ~285s/shard). Drops
+    page cache only (reclaimable); needs passwordless sudo, skipped silently otherwise."""
+    for node in config.NODES:
+        remote.on(node, "sync 2>/dev/null; sudo sysctl -q vm.drop_caches=1 2>/dev/null "
+                        "|| sudo sh -c 'echo 1 > /proc/sys/vm/drop_caches' 2>/dev/null || true",
+                  check=False)
 
 
 def _recipe_up(name):
@@ -227,10 +265,38 @@ def resolve_apply_target(args):
     return args.recipe or current_recipe()
 
 
+def _crash_report(node, cname):
+    """Exit code, OOMKilled flag, and the tail of a container's logs — so a failed bring-up explains
+    itself in-line instead of just pointing the user at `sparkctl logs`."""
+    insp = remote.on(node, f"docker inspect {cname} "
+                           f"--format '{{{{.State.ExitCode}}}}|{{{{.State.OOMKilled}}}}' 2>/dev/null",
+                     capture=True, check=False).stdout.strip()
+    code, _, oom = insp.partition("|")
+    logs = (remote.on(node, f"docker logs --tail 20 {cname} 2>&1 | tail -20",
+                      capture=True, check=False).stdout or "").rstrip()
+    return (code or "?"), (oom.strip().lower() == "true"), logs
+
+
+def _fail_service(svc, node, cname, why):
+    """Print an actionable crash report for one service, then exit non-zero. Called from the wait
+    loop the moment a container is found dead — the deployment is not serving, say so loudly."""
+    code, oom, logs = _crash_report(node, cname)
+    print(f"[wait] ❌ {svc['name']} on {node} {why} (exit={code}, OOMKilled={oom})", flush=True)
+    if oom:
+        print("[wait]    → OOM during load. On unified memory the GPU reservation "
+              "(gpu_memory_utilization × 128GB) and the host-side weight load share ONE pool — "
+              "lower gpu_memory_utilization, drop --safetensors-load-strategy=eager, or use fewer "
+              "replicas per node.", flush=True)
+    if logs:
+        print(f"[wait]    last log lines from {cname}:", flush=True)
+        print("\n".join("        " + ln for ln in logs.splitlines()[-20:]), flush=True)
+    sys.exit(f"[wait] deployment FAILED — '{svc['name']}' is not serving (full log: sparkctl logs {svc['name']})")
+
+
 def _wait_ready(recipe, timeout):
     """Block until every endpoint of the deployment answers /v1/models — vLLM finishes loading
     weights well after its container reports 'Up'. Polls every 5s with a 30s heartbeat, fails
-    FAST if a service's container dies (a crash never becomes ready), exits non-zero on timeout."""
+    FAST (with a crash report) if a service's container dies, exits non-zero on timeout."""
     backend = get_backend()
     served_from = config.SELF or config.SERVER.get("host", "local")
     pending = {(served, base)
@@ -256,12 +322,10 @@ def _wait_ready(recipe, timeout):
         for svc in recipe["services"]:
             node, _, cname = _svc_placement(svc)
             if not status.get(node, {}).get(cname):
-                sys.exit(f"[wait] service '{svc['name']}' on {node} is no longer running — "
-                         f"check: sparkctl logs {svc['name']}")
+                _fail_service(svc, node, cname, "exited during load")
             if svc["engine"] == "vllm" and svc_world(svc) > 1 \
                     and not multinode_serve_alive(cname):
-                sys.exit(f"[wait] service '{svc['name']}' crashed inside its Ray container — "
-                         f"check: sparkctl logs {svc['name']}")
+                _fail_service(svc, node, cname, "crashed inside its Ray container")
         if elapsed - last_note >= 30:
             last_note = elapsed
             print(f"[wait] still loading ({elapsed:.0f}s): "
@@ -271,15 +335,59 @@ def _wait_ready(recipe, timeout):
 
 
 def cmd_apply(args):
+    # --boot is the systemd auto-restore path; a human `apply` never carries it, so human intent
+    # always wins (re-arms boot, ignores the disarm markers).
+    boot = getattr(args, "boot", False)
+    if boot:
+        if _state_read(PAUSED) is not None:
+            print("[boot] disarmed (paused) — serving nothing. `sparkctl apply <recipe>` re-arms.")
+            return
+        stale = _state_read(BOOT_ATTEMPT)
+        if stale:   # last boot started this recipe and never confirmed healthy -> it crashed us
+            _state_write(PAUSED, f"auto-disarmed: {stale} never became healthy last boot (likely OOM)")
+            _state_clear(BOOT_ATTEMPT)
+            print(f"[boot] ⚠️  previous boot of '{stale}' never became healthy — auto-disarming to "
+                  f"break the crash loop.\n"
+                  f"       Fix it (lower gpu_memory_utilization / max_model_len), then: "
+                  f"sparkctl apply {stale}")
+            return
+
     name = resolve_apply_target(args)
     recipe = load_recipe(name)         # validate before tearing anything down
     ensure_models(recipe)              # pull-if-missing: nodes -> NAS -> download, verified
     _services_down()
     (config.ROOT / "current").write_text(name + "\n")
     print(f"current -> {name}")
+    _state_clear(PAUSED)               # an explicit/boot apply re-arms; success clears boot_attempt
+    if boot:
+        _state_write(BOOT_ATTEMPT, name)   # dirty flag: survives a hard OOM that kills this process
+    _free_page_cache()                     # RAM headroom for the loader -> vLLM re-enables prefetch
     _recipe_up(name)
-    if getattr(args, "wait", False):
-        _wait_ready(recipe, getattr(args, "timeout", 1800))
+    # Verify the deployment actually SERVES before reporting success — a launched container is not a
+    # loaded model (vLLM can OOM minutes into loading). Waiting is the default; --detach opts out.
+    if not getattr(args, "detach", False):
+        try:
+            _wait_ready(recipe, getattr(args, "timeout", 1800))
+        except SystemExit:
+            if boot:   # load never came up healthy — disarm so the next boot doesn't retry the OOM
+                _state_write(PAUSED, f"auto-disarmed: {name} failed to become ready last boot")
+                _state_clear(BOOT_ATTEMPT)
+            raise
+    else:
+        print("[apply] launched (detached) — NOT verified serving yet. Containers can still die "
+              "during load; confirm with `sparkctl status` or re-run without --detach to block "
+              "until every endpoint answers.")
+    _state_clear(BOOT_ATTEMPT)         # confirmed healthy (or detached) -> clear the dirty flag
+
+
+def cmd_stop(args):
+    """Tear down every service AND disarm boot: the next boot serves nothing until the next
+    `sparkctl apply <recipe>`. This is the inverse of `apply` and the way to break an OOM/crash
+    loop — `delete services --all` keeps `current`, so the systemd boot unit re-applies it."""
+    _services_down()
+    _state_clear(BOOT_ATTEMPT)
+    _state_write(PAUSED, "stopped via `sparkctl stop`")
+    print("boot disarmed — next boot serves nothing. Re-arm with `sparkctl apply <recipe>`.")
 
 
 def cmd_delete(args):

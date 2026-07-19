@@ -16,6 +16,9 @@ deploy:
   user: you
   remote_path: /opt/sparkctl
 
+# Editor for `sparkctl edit cluster|recipe`. Overridden by $SPARKCTL_EDITOR / $VISUAL / $EDITOR.
+# editor: nano
+
 # Where recipes' model services run: docker (default) | k8s (roadmap).
 backend: docker
 
@@ -53,7 +56,12 @@ server:
 # Robust HF downloads: xet backend disabled by default (known stalls), finite timeouts, a progress
 # watchdog that kills+resumes hangs, and sha256 verification of every shard afterwards.
 download:
-  use_xet: false
+  use_xet: false                  # true -> hf-xet parallel chunked transfer (much faster on
+                                  #   xet-backed repos; sets HF_XET_HIGH_PERFORMANCE=1). Was off by
+                                  #   default for stall bugs, but the stall_timeout watchdog now
+                                  #   kills+resumes any hang, so try `true` if downloads are slow.
+  # max_workers: 8                # optional: parallel shard downloads (`hf download --max-workers`).
+                                  #   Helps when per-connection throughput is throttled. Omit = 1.
   request_timeout: 60             # HF_HUB_DOWNLOAD_TIMEOUT (s)
   etag_timeout: 30                # HF_HUB_ETAG_TIMEOUT (s)
   stall_timeout: 180              # watchdog: kill+resume if cache bytes don't grow for this long

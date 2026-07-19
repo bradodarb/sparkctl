@@ -11,6 +11,8 @@ Config is the single source of truth: cluster.yaml (topology/deploy) + recipes/*
   sparkctl get nodes|services|recipes [-o wide|json]
   sparkctl describe node|service|recipe <name>
   sparkctl create recipe                        # interactive wizard -> recipes/<name>.yaml
+  sparkctl edit cluster | edit recipe <name>    # open in $EDITOR, re-validate on save
+  sparkctl validate [recipe]                    # lint flag/parallel/engine combos (all recipes if omitted)
   sparkctl apply [recipe | -f recipe.yaml]      # ensure + (re)start a deployment
   sparkctl delete services --all | delete service <name>
   sparkctl logs <service> [-f] [--tail N] | top nodes|services | status
@@ -27,6 +29,8 @@ from sparkctl import config, remote, secrets
 from sparkctl.backends import get_backend
 from sparkctl.cli import resource
 from sparkctl.cli.create import cmd_create
+from sparkctl.cli.edit import cmd_edit
+from sparkctl.cli.validate import cmd_validate
 from sparkctl.deploy import deploy, deploy_init
 from sparkctl.distribution import mirror_to_others
 from sparkctl.manifest import verify_deployment, write_active_manifest
@@ -77,6 +81,10 @@ def cmd_status(args):
     have = (config.ROOT / "recipes" / f"{cur}.yaml").exists()
     print(f"current recipe: {cur}" + (f"  (sha {recipe_hash(cur)[:12]})" if have else "  (recipe file missing!)"),
           flush=True)
+    paused = resource._state_read(resource.PAUSED)
+    if paused is not None:
+        print(f"⏸  boot DISARMED — {paused or 'paused'}. Serves nothing on boot; "
+              f"re-arm with `sparkctl apply <recipe>`.", flush=True)
     for node in config.NODES:
         rec, ok = verify_deployment(node)
         badge = "✅ matches current" if ok else ("⚠️  DRIFT" if rec else "· nothing active")
@@ -154,18 +162,31 @@ def build_parser():
     p = sub.add_parser("create", help="author a new recipe (interactive wizard, sane defaults)")
     p.add_argument("kind", choices=["recipe"])
     p.set_defaults(fn=cmd_create)
+    p = sub.add_parser("edit", help="open cluster.yaml or a recipe in $EDITOR (re-validates on save)")
+    p.add_argument("kind", choices=["cluster", "recipe"])
+    p.add_argument("name", nargs="?")
+    p.set_defaults(fn=cmd_edit)
+    p = sub.add_parser("validate", help="lint recipe(s) for bad flag/parallel/engine combinations")
+    p.add_argument("recipe", nargs="?", help="recipe name (omit to lint every recipe)")
+    p.add_argument("--fix", action="store_true", help="apply the auto-fixable findings and rewrite the file")
+    p.set_defaults(fn=cmd_validate)
     p = sub.add_parser("apply", help="deploy a recipe (validate, restart services, update current)")
     p.add_argument("recipe", nargs="?")
     p.add_argument("-f", "--filename", help="recipe manifest file (copied into recipes/)")
     p.add_argument("--wait", action="store_true",
-                   help="block until every service endpoint answers (models loaded)")
-    p.add_argument("--timeout", type=int, default=1800, help="--wait limit in seconds")
+                   help="(default) block until every endpoint answers; kept for back-compat")
+    p.add_argument("--detach", action="store_true",
+                   help="return once containers launch, WITHOUT verifying they serve")
+    p.add_argument("--timeout", type=int, default=1800, help="readiness wait limit in seconds")
+    p.add_argument("--boot", action="store_true", help=argparse.SUPPRESS)  # systemd boot-restore path
     p.set_defaults(fn=resource.cmd_apply)
     p = sub.add_parser("delete", help="tear down services")
     p.add_argument("kind", choices=["service", "services"])
     p.add_argument("name", nargs="?")
     p.add_argument("--all", action="store_true")
     p.set_defaults(fn=resource.cmd_delete)
+    sub.add_parser("stop", help="tear down all services AND disarm boot (breaks an OOM/crash loop)"
+                   ).set_defaults(fn=resource.cmd_stop)
     p = sub.add_parser("top", help="live vLLM metrics in the terminal")
     p.add_argument("resource", choices=["nodes", "services"])
     p.add_argument("--interval", type=float, default=2.0)
@@ -235,10 +256,10 @@ def launch_pull_queue_on_head(recipes):
 
 
 # Verbs that run directly on the control machine (they SSH per node as needed) — no deploy.
-# `create` only writes into the repo's recipes/ — purely local, never touches the nodes.
-LOCAL_VERBS = ("get", "describe", "top", "current", "secret", "create")
+# `create`/`edit` only touch the repo's cluster.yaml / recipes/ — purely local, never the nodes.
+LOCAL_VERBS = ("get", "describe", "top", "current", "secret", "create", "edit", "validate")
 # Mutating verbs push the repo to the nodes first, then run on the head.
-DEPLOY_VERBS = ("apply", "delete", "pull", "mirror", "build")
+DEPLOY_VERBS = ("apply", "delete", "stop", "pull", "mirror", "build")
 
 
 def control_main(argv):
@@ -264,9 +285,10 @@ def control_main(argv):
         a = build_parser().parse_args(argv)
         name = resource.resolve_apply_target(a)
         (config.ROOT / "current").write_text(name + "\n")
-        argv = ["apply", name]
-        if a.wait:
-            argv += ["--wait", "--timeout", str(a.timeout)]
+        # readiness wait is the default on the head; forward --detach to opt out, timeout always
+        argv = ["apply", name, "--timeout", str(a.timeout)]
+        if a.detach:
+            argv.append("--detach")
     if cmd in DEPLOY_VERBS:
         deploy()
     rc = run_head(argv)

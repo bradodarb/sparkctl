@@ -41,5 +41,8 @@ def sync_to_nodes():
     for node in config.NODES:
         a = remote.node_addr(node)
         remote.on(node, "mkdir -p ~/.sparkctl", check=False)
-        remote.sh(f"rsync -a --chmod=F600 {PATH} {config.USER}@{a}:{NODE_PATH}")
+        # `-a` already preserves the source's 0600; set it explicitly too since older rsync (macOS
+        # ships 2.6.9) rejects --chmod. Perms enforced on the node, not via a version-specific flag.
+        remote.sh(f"rsync -a {PATH} {config.USER}@{a}:{NODE_PATH}")
+        remote.on(node, f"chmod 600 {NODE_PATH}", check=False)
         print(f"[secret] synced -> {node}")

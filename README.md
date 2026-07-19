@@ -17,9 +17,14 @@ SSH; on a **cluster node** it is the orchestrator the boot daemon and forwarded 
 sparkctl get nodes|services|recipes|models [-o wide|json]
 sparkctl describe node|service|recipe <name>
 sparkctl create recipe                     # interactive wizard: writes recipes/<name>.yaml (sane defaults)
-sparkctl apply [recipe | -f recipe.yaml] [--wait]  # ensure weights -> (re)start -> update current
-                                           #   --wait blocks until every endpoint answers (loaded)
+sparkctl edit cluster | edit recipe <name> # open in $EDITOR (SPARKCTL_EDITOR/cluster.yaml editor:), re-validate on save
+sparkctl validate [recipe] [--fix]         # lint flag/parallel/engine combos (--fix auto-repairs; all recipes if omitted)
+sparkctl apply [recipe | -f recipe.yaml] [--detach]  # ensure weights -> (re)start -> update current
+                                           #   waits until every endpoint answers by DEFAULT (success =
+                                           #   serving); a failed load prints exit code/OOMKilled + log
+                                           #   tail. --detach returns at launch without verifying.
 sparkctl delete services --all             # tear everything down (delete service <name> for one)
+sparkctl stop                              # tear down AND disarm boot — breaks an OOM/crash-on-boot loop
 sparkctl logs <service> [-f] [--tail N]
 sparkctl top nodes|services               # live terminal metrics (engine + node baseline)
 sparkctl status                            # one-glance summary: drift check + API health
@@ -111,7 +116,12 @@ SSH, boot persistence via systemd on the head) or **k8s** (roadmap stub; the sea
 
 ## Model distribution — verified, NAS-aware
 
-`apply` ensures weights before serving: **nodes → NAS → download**.
+`apply` ensures weights before serving: **nodes → NAS → download**. When a model isn't present
+yet, `apply` (with or without `--wait`) streams **live progress**: the head download shows
+`downloaded / total (percent) rate ETA` (total is a best-effort HF-API lookup; it falls back to
+downloaded-bytes + rate if unavailable), and each node's fabric replication shows rsync's aggregate
+`--info=progress2` percent/rate/ETA — so you can watch both the download and per-node mirror before
+the load phase begins.
 
 - Default (no NAS): download **once on the head** (single stream, resumable, stall-watchdog),
   **verify every shard** (`sha256 == blob name`, corrupt shards auto-deleted + re-fetched), then
@@ -170,6 +180,16 @@ pytest -q        # config/routing/manifest/distribution/server logic — no live
   older images fail to load them. **Ray** isn't in `26.06` — the derived image adds it.
 - **Unified memory:** the 128GB is shared system+GPU; keep `gpu_memory_utilization` low enough to
   leave headroom (0.85), and don't run big downloads *while loading* a big model. `nvidia-smi`
-  memory reads `N/A` — sparkctl's node baseline uses `/proc/meminfo` instead.
+  memory reads `N/A` — sparkctl's node baseline uses `/proc/meminfo` instead. vLLM *pre-allocates*
+  KV cache up to `gpu_memory_utilization × 128GB` at startup, so even a *small* model OOMs the node
+  if that fraction is too high (`validate` warns above 0.9) — the KV block, not the weights, is
+  usually what kills the node during load.
+- **Boot crash-loop / disarm:** the boot unit runs `sparkctl apply --boot --wait`. If a recipe
+  OOMs/crashes during load, the node would otherwise re-apply the same killer recipe every reboot
+  forever. `apply --boot` guards against this: it writes a `boot_attempt` marker *before* load and
+  clears it only once the deployment is confirmed healthy — so a boot that finds the marker still
+  set knows the previous boot never came up and **auto-disarms** (serves nothing, logs why) instead
+  of retrying. `sparkctl stop` disarms manually; the next `sparkctl apply <recipe>` re-arms.
+  `status` shows `⏸ boot DISARMED` when paused.
 - **Mirror** is owner/group-agnostic and excludes `.locks/`/`*.incomplete`; never leave an orphaned
   root download container running (it holds the HF flock and blocks later downloads).

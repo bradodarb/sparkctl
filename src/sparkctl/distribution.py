@@ -2,6 +2,7 @@
 
 Every shard is sha256-verified (blob name == content hash) before it can ever reach a serve;
 corrupt shards are deleted and re-fetched. See docs/backends.md for the rationale."""
+import base64
 import json
 import sys
 import time
@@ -15,6 +16,42 @@ def dl_cname(model):
     return f"{config.PFX}-dl-{model.replace('/', '_')}"
 
 
+# ---------------------------------------------------------------- progress helpers
+def _human(n):
+    """Bytes -> a short human string (1.0KB..): for download/mirror progress lines."""
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+
+
+def _fmt_dur(sec):
+    sec = int(max(sec, 0))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
+
+
+def hf_repo_size(model, cache=None):
+    """Best-effort total download size (bytes) for progress display, from the HF API on the head
+    with the configured token. None when it can't be determined (gated/offline/rate-limited) — the
+    caller then shows a size+rate line without a percentage. Never fatal, never touches weights."""
+    inner = ('set -a; [ -f "$HOME/.sparkctl/secrets.env" ] && . "$HOME/.sparkctl/secrets.env"; set +a; '
+             f'curl -sfL --max-time 20 ${{HF_TOKEN:+-H "Authorization: Bearer $HF_TOKEN"}} '
+             f'"https://huggingface.co/api/models/{model}/tree/main?recursive=true"')
+    out = remote.on(config.HEAD, f"bash -lc {json.dumps(inner)}", capture=True, check=False).stdout
+    try:
+        items = json.loads(out)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(items, list):
+        return None
+    total = sum((it.get("lfs") or {}).get("size") or it.get("size") or 0 for it in items
+                if isinstance(it, dict))
+    return total or None
+
+
 def _dl_env():
     """Research-backed robustness env for HF downloads: the modern hf-xet backend has known stalls,
     and the plain downloader honors HF_HUB_DOWNLOAD_TIMEOUT (a hung read -> retryable TimeoutError).
@@ -24,6 +61,8 @@ def _dl_env():
          f"-e HF_HUB_ETAG_TIMEOUT={dl.get('etag_timeout', 30)}"]
     if not dl.get("use_xet", False):
         e.append("-e HF_HUB_DISABLE_XET=1")
+    else:
+        e.append("-e HF_XET_HIGH_PERFORMANCE=1")   # xet: parallel chunked range-GETs (fast path)
     return " ".join(e)
 
 
@@ -34,23 +73,29 @@ def hf_download_start(model, cache=None):
     via `-e HF_TOKEN` (name only — value never lands on the command line/ps/logs). Robustness env
     from _dl_env(). `cache` overrides the node cache — e.g. a NAS mount, so downloads land there."""
     name = dl_cname(model)
+    workers = config.DL.get("max_workers")
+    wflag = f" --max-workers {int(workers)}" if workers else ""   # opt-in parallel shard downloads
     inner = ('[ -f "$HOME/.hugging_face.sh" ] && . "$HOME/.hugging_face.sh"; '
              'set -a; [ -f "$HOME/.sparkctl/secrets.env" ] && . "$HOME/.sparkctl/secrets.env"; set +a; '
+             'if [ -n "$HF_TOKEN" ]; then echo "[pull:hf] HF auth: authenticated"; '
+             'else echo "[pull:hf] HF auth: ANONYMOUS (no HF_TOKEN — gated repos will fail)"; fi; '
              f'docker rm -f {name} >/dev/null 2>&1 || true; '
              f'docker run -d --name {name} --user "$(id -u):$(id -g)" '
              f'-e HOME=/cache -e HF_HOME=/cache -e XDG_CACHE_HOME=/cache '
              f'${{HF_TOKEN:+-e HF_TOKEN}} {_dl_env()} -v {cache or config.CACHE}:/cache {config.IMAGE} '
-             f'hf download {model} >/dev/null')
+             f'hf download {model}{wflag} >/dev/null')
     remote.on(config.HEAD, f"bash -lc {json.dumps(inner)}")
     return name
 
 
-def _wait_with_watchdog(name, model, cache=None):
-    """Supervise a running download: return 'exited' when the container stops, or kill it and return
-    'stalled' if the cache stops growing for stall_timeout (turns any hang into a resumable retry)."""
+def _wait_with_watchdog(name, model, cache=None, total=None):
+    """Supervise a running download: print a progress line each poll (percent + rate + ETA when the
+    total is known, else downloaded-bytes + rate), return 'exited' when the container stops, or kill
+    it and return 'stalled' if the cache stops growing for stall_timeout (any hang -> resumable)."""
     stall = config.DL.get("stall_timeout", 180)
     cache_dir = f"{cache or config.CACHE}/hub/models--{model.replace('/', '--')}"
     last_size, last_change = -1, time.time()
+    prev_size, prev_t = None, time.time()
     while True:
         st = remote.on(config.HEAD, f"docker inspect -f '{{{{.State.Status}}}}' {name} 2>/dev/null",
                        capture=True, check=False).stdout.strip()
@@ -59,9 +104,22 @@ def _wait_with_watchdog(name, model, cache=None):
         out = remote.on(config.HEAD, f"du -sb {cache_dir} 2>/dev/null | cut -f1",
                         capture=True, check=False).stdout.strip()
         size = int(out) if out.isdigit() else last_size
+        now = time.time()
+        rate = ((size - prev_size) / (now - prev_t)
+                if prev_size is not None and now > prev_t and size >= prev_size else None)
+        prev_size, prev_t = size, now
+        if size and size >= 0:
+            if total:
+                eta = f"  ETA {_fmt_dur((total - size) / rate)}" if rate and rate > 0 else ""
+                rt = f"  {_human(rate)}/s" if rate else ""
+                print(f"[pull:hf] {model}  {_human(size)}/{_human(total)} "
+                      f"({min(100, size * 100 // total)}%){rt}{eta}", flush=True)
+            else:
+                rt = f"  (+{_human(rate)}/s)" if rate else ""
+                print(f"[pull:hf] {model}  {_human(size)} downloaded{rt}", flush=True)
         if size != last_size:
-            last_size, last_change = size, time.time()
-        elif time.time() - last_change > stall:
+            last_size, last_change = size, now
+        elif now - last_change > stall:
             print(f"[pull:hf] no progress for {stall}s — killing {name} to resume")
             remote.on(config.HEAD, f"docker rm -f {name}", check=False)
             return "stalled"
@@ -84,10 +142,12 @@ def _pull_hf(svc, cache=None):
     m = svc["model"]
     name = dl_cname(m)
     attempts = config.DL.get("max_attempts", 4)
+    total = hf_repo_size(m, cache=cache)   # best-effort, for the progress %/ETA; None -> size+rate
     for attempt in range(1, attempts + 1):
-        print(f"[pull:hf] {m} -> {config.HEAD} (download attempt {attempt}/{attempts})")
+        print(f"[pull:hf] {m} -> {config.HEAD} (download attempt {attempt}/{attempts}"
+              + (f", {_human(total)} total)" if total else ")"))
         hf_download_start(m, cache=cache)
-        if _wait_with_watchdog(name, m, cache=cache) == "stalled":
+        if _wait_with_watchdog(name, m, cache=cache, total=total) == "stalled":
             print("[pull:hf] stalled — resuming from partial")
             continue                                 # watchdog already removed the container
         rc = remote.on(config.HEAD, f"docker inspect -f '{{{{.State.ExitCode}}}}' {name}",
@@ -122,7 +182,7 @@ def _rsync_hub(ip, checksum=False):
     # --no-owner/--no-group: don't chgrp (user can't; everything is user-owned on write anyway).
     # exclude .locks/ (transient) + *.incomplete (partials). -c: content checksum (repair mode).
     c = "c" if checksum else ""
-    remote.on(config.HEAD, f"rsync -a{c} --no-owner --no-group --delete "
+    remote.on(config.HEAD, f"rsync -a{c}h --info=progress2 --no-owner --no-group --delete "
                            f"--exclude '.locks/' --exclude '*.incomplete' "
                            f"{config.CACHE}/hub/ {config.USER}@{ip}:{config.CACHE}/hub/")
 
@@ -329,6 +389,7 @@ def replicate_model(model, node, source, checksum=False):
     """Per-model rsync from `source` ('head' | 'nas') to a node. NAS path mode pushes from the
     head (which sees the mount); NAS ssh mode pulls on the destination node (node -> NAS ssh)."""
     c = RSYNC_FLAGS if not checksum else RSYNC_FLAGS.replace("-a ", "-ac ")
+    c = "-h --info=progress2 " + c   # aggregate percent/rate/ETA for this node's replication
     hub = _hub_dir(model)
     nas = _nas() or {}
     remote.on(node, f"mkdir -p {config.CACHE}/{hub}", check=False)
@@ -376,6 +437,32 @@ def push_to_nas(model):
                   check=False)
 
 
+def prune_model_cache(model, nodes=None):
+    """Reclaim disk in a model's HF cache dir on each node: delete stale *.incomplete partials and
+    any blob NOT referenced by a current snapshot symlink (left behind by interrupted or superseded
+    pulls — e.g. a corrupted-name attempt). Best-effort and SAFE: it bails if the dir has no live
+    snapshot refs, so it can never delete the weights actually in use."""
+    hub = f"{config.CACHE}/{_hub_dir(model)}"
+    script = (
+        f'hub="{hub}"; [ -d "$hub" ] || exit 0\n'
+        'find "$hub" -name "*.incomplete" -delete 2>/dev/null\n'
+        'ref="$(mktemp)"; find "$hub/snapshots" -type l 2>/dev/null '
+        '-exec readlink {} \\; | sed "s#.*/##" | sort -u > "$ref"\n'
+        '[ -s "$ref" ] || { rm -f "$ref"; exit 0; }\n'   # no live snapshot refs -> never touch blobs
+        'freed=0\n'
+        'for b in "$hub/blobs/"*; do [ -f "$b" ] || continue; '
+        'grep -qxF "$(basename "$b")" "$ref" && continue; '
+        'sz=$(stat -c%s "$b" 2>/dev/null || echo 0); rm -f "$b" && freed=$((freed+sz)); done\n'
+        'rm -f "$ref"; [ "$freed" -gt 0 ] && echo "freed $((freed/1024/1024))MB" || true\n'
+    )
+    b64 = base64.b64encode(script.encode()).decode()
+    for node in (nodes or config.NODES):
+        out = (remote.on(node, f"echo {b64} | base64 -d | bash",
+                         capture=True, check=False).stdout or "").strip()
+        if out:
+            print(f"[prune] {node}: {model} — {out}")
+
+
 def ensure_models(recipe):
     """`apply`'s pull-if-missing: for each model, check the nodes, then the NAS, then download —
     replicating from whichever source has the weights. Every transfer is sha256-verified.
@@ -398,23 +485,27 @@ def ensure_models(recipe):
             print(f"[ensure] {m}: found on NAS — replicating to {', '.join(missing)}")
             for node in missing:
                 _replicate_verified(m, node, source="nas")
-            continue
         # nowhere yet -> download. A mounted NAS is always the download target (that's the point
         # of configuring one); ssh mode can't be mounted into the download container, so it
         # downloads to the head and archives a copy back to the NAS below.
-        if nas and _nas_mode(nas) == "path":
+        elif nas and _nas_mode(nas) == "path":
             print(f"[ensure] {m}: downloading to NAS ({nas['path']})")
             _pull_hf(svc, cache=nas["path"])
             for node in missing:
                 _replicate_verified(m, node, source="nas")
-            continue
-        if config.HEAD in missing:
-            _pull_hf(svc)                        # verified download on the head
-            missing.remove(config.HEAD)
-        for node in missing:
-            _replicate_verified(m, node, source="head")
-        if nas:
-            push_to_nas(m)
+        else:
+            if config.HEAD in missing:
+                _pull_hf(svc)                    # verified download on the head
+                missing.remove(config.HEAD)
+            for node in missing:
+                _replicate_verified(m, node, source="head")
+            if nas:
+                push_to_nas(m)
+
+    # reclaim stale partials + orphaned blobs left by interrupted/superseded pulls (SAFE: never
+    # touches blobs a live snapshot references). Runs for every hf model in the recipe.
+    for m in {s["model"] for s in recipe["services"] if svc_provider(s) == "hf"}:
+        prune_model_cache(m)
 
 
 def mirror_to_others(models=None):

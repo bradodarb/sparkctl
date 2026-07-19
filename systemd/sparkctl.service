@@ -11,7 +11,11 @@ Type=oneshot
 RemainAfterExit=yes
 User={{USER}}
 WorkingDirectory={{REMOTE}}
-ExecStart={{REMOTE}}/bin/sparkctl apply
+# --boot: honor the disarm/self-heal markers (skip if paused; auto-disarm if the previous boot's
+#   load never became healthy — i.e. it OOM'd the node — instead of retrying the killer recipe).
+# --wait: block until the deployment is confirmed healthy so a failed load is observed and the
+#   boot_attempt dirty flag is cleared only on success.
+ExecStart={{REMOTE}}/bin/sparkctl apply --boot --wait
 ExecStop={{REMOTE}}/bin/sparkctl delete services --all
 # generous: first boot after a recipe switch may warm 100GB+ of weights into page cache
 TimeoutStartSec=2400

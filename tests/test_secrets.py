@@ -23,13 +23,17 @@ def test_sync_rsyncs_to_every_node(monkeypatch, tmp_path):
     p = tmp_path / "secrets.env"
     secrets.save({"HF_TOKEN": "x"}, path=p)
     monkeypatch.setattr(secrets, "PATH", p)
-    monkeypatch.setattr(remote, "on", lambda node, cmd, **k: None)
+    on_calls = []
+    monkeypatch.setattr(remote, "on", lambda node, cmd, **k: on_calls.append((node, cmd)))
     calls = []
     monkeypatch.setattr(remote, "sh", lambda cmd, **k: calls.append(cmd))
     secrets.sync_to_nodes()
     assert len(calls) == len(config.NODES)
-    # a file transfer with tight perms — the value itself never rides a shell command line
-    assert all("rsync" in c and "--chmod=F600" in c for c in calls)
+    # a file transfer — the value itself never rides a shell command line. No --chmod flag (older
+    # rsync, e.g. macOS 2.6.9, rejects it); perms are enforced with an explicit chmod on the node.
+    assert all("rsync" in c and "--chmod" not in c for c in calls)
+    assert all(any(f"chmod 600 {secrets.NODE_PATH}" in cmd for n, cmd in on_calls if n == node)
+               for node in config.NODES)
 
 
 def test_sync_noop_without_file(monkeypatch, tmp_path):

@@ -45,18 +45,21 @@ def test_apply_deploys_then_forwards_to_head(tmp_root, monkeypatch):
     monkeypatch.setattr(main, "refresh_server_if_running", lambda: calls.append(("refresh",)))
     main.control_main(["apply", "r2"])
     assert ("deploy",) in calls                       # auto-deploy-before-forward must survive
-    assert ("run_head", ["apply", "r2"]) in calls
+    fwd = ("run_head", ["apply", "r2", "--timeout", "1800"])
+    assert fwd in calls                               # waits by default (timeout forwarded, no --detach)
     assert (tmp_root / "current").read_text().strip() == "r2"   # repo pointer kept in sync
-    assert calls.index(("deploy",)) < calls.index(("run_head", ["apply", "r2"]))
+    assert calls.index(("deploy",)) < calls.index(fwd)
 
 
-def test_apply_wait_flag_survives_the_forward(tmp_root, monkeypatch):
+def test_apply_waits_by_default_and_detach_opts_out(tmp_root, monkeypatch):
     calls = []
     monkeypatch.setattr(main, "deploy", lambda: None)
     monkeypatch.setattr(main, "run_head", lambda argv: calls.append(argv))
     monkeypatch.setattr(main, "refresh_server_if_running", lambda: None)
-    main.control_main(["apply", "r2", "--wait", "--timeout", "600"])
-    assert calls == [["apply", "r2", "--wait", "--timeout", "600"]]
+    main.control_main(["apply", "r2", "--timeout", "600"])
+    main.control_main(["apply", "r2", "--detach"])
+    assert calls[0] == ["apply", "r2", "--timeout", "600"]   # default: wait, no --detach forwarded
+    assert "--detach" in calls[1]                            # opt-out is forwarded to the head
 
 
 class WaitBackend:
@@ -105,8 +108,11 @@ def test_wait_ready_fails_fast_on_dead_multinode_serve(tmp_root, monkeypatch):
     monkeypatch.setattr(resource, "multinode_serve_alive", lambda cname: False)
     monkeypatch.setattr(resource.remote, "sh",
                         lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="", stderr=""))
+    # crash report probes the container over remote.on — return an exit code + OOM flag + logs
+    monkeypatch.setattr(resource.remote, "on",
+                        lambda node, cmd, **kw: SimpleNamespace(returncode=0, stdout="1|true", stderr=""))
     monkeypatch.setattr(resource.time, "sleep", lambda s: None)
-    with pytest.raises(SystemExit, match="crashed inside its Ray container"):
+    with pytest.raises(SystemExit, match="not serving"):
         resource._wait_ready(recipe, timeout=60)
 
 
@@ -118,9 +124,15 @@ def test_wait_ready_fails_fast_when_a_service_dies(tmp_root, monkeypatch):
                         lambda: WaitBackend(bases=["http://n1:8000/v1"], running=False))
     monkeypatch.setattr(resource.remote, "sh",
                         lambda cmd, **kw: SimpleNamespace(returncode=1, stdout="", stderr=""))
+    onc = []
+    monkeypatch.setattr(resource.remote, "on",
+                        lambda node, cmd, **kw: onc.append(cmd) or
+                        SimpleNamespace(returncode=0, stdout="1|false", stderr="crash log line"))
     monkeypatch.setattr(resource.time, "sleep", lambda s: None)
-    with pytest.raises(SystemExit, match="sparkctl logs agent"):
+    with pytest.raises(SystemExit, match="not serving"):
         resource._wait_ready(recipe, timeout=60)
+    assert any("docker inspect" in c for c in onc)   # auto crash report pulled the exit/OOM state
+    assert any("docker logs" in c for c in onc)      # ...and the log tail
 
 
 def test_apply_dash_f_copies_into_recipes(tmp_root, tmp_path, monkeypatch):
@@ -132,7 +144,8 @@ def test_apply_dash_f_copies_into_recipes(tmp_root, tmp_path, monkeypatch):
     src.write_text(yaml.safe_dump({"name": "elsewhere", "services": []}))
     main.control_main(["apply", "-f", str(src)])
     assert (tmp_root / "recipes" / "elsewhere.yaml").exists()   # manifest became a repo recipe
-    assert ("run_head", ["apply", "elsewhere"]) in calls        # forwarded by name, not path
+    assert any(c[0] == "run_head" and c[1][:2] == ["apply", "elsewhere"]
+               for c in calls)                                  # forwarded by name, not path
 
 
 def test_readonly_verbs_do_not_deploy(tmp_root, monkeypatch, capsys):
@@ -197,3 +210,11 @@ other_metric 99
 def test_parse_metrics_handles_garbage():
     assert resource.parse_metrics(None, ["vllm:x"]) == {}
     assert resource.parse_metrics("vllm:x{bad", ["vllm:x"]) == {}
+
+
+def test_free_page_cache_drops_on_every_node(tmp_root, monkeypatch):
+    cmds = []
+    monkeypatch.setattr(resource.remote, "on", lambda node, cmd, **k: cmds.append((node, cmd)))
+    resource._free_page_cache()
+    assert len(cmds) == len(config.NODES)
+    assert all("drop_caches" in c for _, c in cmds)   # page-cache flush issued per node
