@@ -40,7 +40,7 @@ def hf_repo_size(model, cache=None):
     inner = ('set -a; [ -f "$HOME/.sparkctl/secrets.env" ] && . "$HOME/.sparkctl/secrets.env"; set +a; '
              f'curl -sfL --max-time 20 ${{HF_TOKEN:+-H "Authorization: Bearer $HF_TOKEN"}} '
              f'"https://huggingface.co/api/models/{model}/tree/main?recursive=true"')
-    out = remote.on(config.HEAD, f"bash -lc {json.dumps(inner)}", capture=True, check=False).stdout
+    out = remote.bash(config.HEAD, inner, capture=True, check=False).stdout
     try:
         items = json.loads(out)
     except (ValueError, TypeError):
@@ -84,7 +84,7 @@ def hf_download_start(model, cache=None):
              f'-e HOME=/cache -e HF_HOME=/cache -e XDG_CACHE_HOME=/cache '
              f'${{HF_TOKEN:+-e HF_TOKEN}} {_dl_env()} -v {cache or config.CACHE}:/cache {config.IMAGE} '
              f'hf download {model}{wflag} >/dev/null')
-    remote.on(config.HEAD, f"bash -lc {json.dumps(inner)}")
+    remote.bash(config.HEAD, inner)   # base64 transport — bash -lc quoting silently dropped the token
     return name
 
 

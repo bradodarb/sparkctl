@@ -1,4 +1,5 @@
 """Execution + addressing layer: run commands locally or on nodes over SSH."""
+import base64
 import shlex
 import subprocess
 
@@ -23,6 +24,15 @@ def on(node, cmd, **kw):
     if node == config.SELF:
         return sh(cmd, **kw)
     return sh(f"ssh -o BatchMode=yes {config.USER}@{node_addr(node)} {shlex.quote(cmd)}", **kw)
+
+
+def bash(node, script, **kw):
+    """Run a bash script on a node WITHOUT quoting hell: base64-encode it and decode on the far side.
+    Use this (not `on(node, f'bash -lc {json.dumps(...)}')`) for anything that sources files, has
+    nested quotes, or expands vars — the multi-layer ssh/shlex/json quoting silently drops lines
+    (e.g. it was failing to source ~/.sparkctl/secrets.env, so downloads went anonymous)."""
+    b64 = base64.b64encode(script.encode()).decode()
+    return on(node, f"echo {b64} | base64 -d | bash", **kw)
 
 
 def backend_host(node, served_from):

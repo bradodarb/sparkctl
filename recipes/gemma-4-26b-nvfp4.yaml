@@ -5,8 +5,10 @@
 # and node-failure resilience. NVFP4 (Blackwell-native) A4B MoE is small (~13GB weights), so each
 # replica fits a single GB10 comfortably — no Ray, no tensor parallelism.
 #
-# NVFP4 notes: needs vLLM >= 0.22 (the csv-vllm:26.06 image, inherited from cluster.yaml) and
-# env VLLM_USE_FLASHINFER_MOE_FP4: "1" for the FlashInfer FP4 MoE kernels. Load is STREAMED
+# NVFP4 notes: needs vLLM >= 0.22 (the csv-vllm:26.06 image, inherited from cluster.yaml). Do NOT
+# force VLLM_USE_FLASHINFER_MOE_FP4 — it's deprecated in 0.22 and Gemma-4's MoE has no FlashInfer
+# FP4 backend, so forcing it raises NotImplementedError. Let vLLM auto-select the MoE backend.
+# Load is STREAMED
 # (no --safetensors-load-strategy=eager — eager buffers the whole checkpoint in host RAM and OOMs
 # on unified memory). reasoning_parser is intentionally omitted: Gemma-4 emits no separate reasoning
 # channel, so it would be a no-op that only risks confusing OpenAI-style harnesses.
@@ -22,8 +24,6 @@ services:
   max_model_len: 65536
   gpu_memory_utilization: 0.85
   tool_call_parser: gemma4
-  env:
-    VLLM_USE_FLASHINFER_MOE_FP4: "1"
 - name: agent-ref
   engine: vllm
   provider: hf
@@ -34,5 +34,3 @@ services:
   max_model_len: 65536
   gpu_memory_utilization: 0.85
   tool_call_parser: gemma4
-  env:
-    VLLM_USE_FLASHINFER_MOE_FP4: "1"

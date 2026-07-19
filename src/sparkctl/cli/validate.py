@@ -170,10 +170,14 @@ def lint_recipe(recipe, *, known_nodes=None, head=None):
                         "remove env RAY_memory_monitor_refresh_ms",
                         fix=lambda s=svc: _del_env(s, "RAY_memory_monitor_refresh_ms"))
 
-            if "nvfp4" in (svc.get("model") or "").lower() and env.get("VLLM_USE_FLASHINFER_MOE_FP4") != "1":
-                add(WARN, f"{label}: NVFP4 model without env VLLM_USE_FLASHINFER_MOE_FP4: \"1\" (FlashInfer MoE kernels off)",
-                    'add env VLLM_USE_FLASHINFER_MOE_FP4: "1"',
-                    fix=lambda s=svc: _set_env(s, "VLLM_USE_FLASHINFER_MOE_FP4", "1"))
+            # VLLM_USE_FLASHINFER_MOE_FP4 is deprecated in vLLM >= 0.22 and model-specific: some NVFP4
+            # MoEs (e.g. Gemma-4) have no FlashInfer FP4 backend, so forcing it raises
+            # NotImplementedError at load. Don't mandate it — flag it as a likely-broken setting.
+            if str(env.get("VLLM_USE_FLASHINFER_MOE_FP4")) == "1":
+                add(WARN, f"{label}: env VLLM_USE_FLASHINFER_MOE_FP4 is deprecated (vLLM>=0.22) and unsupported "
+                    f"by some NVFP4 MoEs (Gemma-4 -> NotImplementedError at load); let vLLM auto-select instead",
+                    "remove env VLLM_USE_FLASHINFER_MOE_FP4 (or use --moe-backend for a specific kernel)",
+                    fix=lambda s=svc: _del_env(s, "VLLM_USE_FLASHINFER_MOE_FP4"))
 
         # cross-service / topology checks (both engines)
         if node and known_nodes and node not in known_nodes:

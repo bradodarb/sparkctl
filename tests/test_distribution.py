@@ -287,6 +287,14 @@ def test_dl_env_xet_high_performance(monkeypatch):
     assert "HF_HUB_DISABLE_XET" not in e
 
 
+def _decode_bash(cmd):
+    """The download command is base64-transported (`echo <b64> | base64 -d | bash`) — decode the
+    inner script so tests can assert on it. This transport is the fix for secrets.env not sourcing."""
+    import base64 as _b64
+    assert "base64 -d | bash" in cmd                 # robust transport, not fragile bash -lc "<json>"
+    return _b64.b64decode(cmd.split("echo ", 1)[1].split(" |", 1)[0]).decode()
+
+
 def test_download_start_logs_auth_and_opt_in_workers(monkeypatch):
     import types as _t
     monkeypatch.setattr(config, "DL", {"use_xet": False, "max_workers": 8})
@@ -296,9 +304,11 @@ def test_download_start_logs_auth_and_opt_in_workers(monkeypatch):
                         _t.SimpleNamespace(stdout="", returncode=0, stderr=""))
     name = distribution.hf_download_start("org/M")
     assert name == distribution.dl_cname("org/M")
-    assert "HF auth:" in sent["cmd"]                 # auth visibility echo
-    assert "${HF_TOKEN:+-e HF_TOKEN}" in sent["cmd"]  # token passed by name only when present
-    assert "--max-workers 8" in sent["cmd"]
+    inner = _decode_bash(sent["cmd"])
+    assert "secrets.env" in inner                    # sources the token file (base64 transport fix)
+    assert "HF auth:" in inner                        # auth visibility echo
+    assert "${HF_TOKEN:+-e HF_TOKEN}" in inner        # token passed by name only when present
+    assert "--max-workers 8" in inner
 
 
 def test_download_start_no_workers_flag_by_default(monkeypatch):
@@ -309,7 +319,7 @@ def test_download_start_no_workers_flag_by_default(monkeypatch):
                         lambda node, cmd, **kw: sent.update(cmd=cmd) or
                         _t.SimpleNamespace(stdout="", returncode=0, stderr=""))
     distribution.hf_download_start("org/M")
-    assert "--max-workers" not in sent["cmd"]        # opt-in only
+    assert "--max-workers" not in _decode_bash(sent["cmd"])   # opt-in only
 
 
 def test_prune_model_cache_is_safe_and_targeted(monkeypatch):
@@ -333,3 +343,15 @@ def test_ensure_auto_prunes_recipe_models(fake, monkeypatch):
     monkeypatch.setattr(distribution, "prune_model_cache", lambda m, **k: pruned.append(m))
     distribution.ensure_models(RECIPE)
     assert pruned == ["org/M"]                                 # auto-prune ran for the hf model
+
+
+def test_remote_bash_uses_base64_transport(monkeypatch):
+    import base64 as _b64, types as _t
+    from sparkctl import remote
+    got = {}
+    monkeypatch.setattr(remote, "on", lambda node, cmd, **k: got.update(node=node, cmd=cmd) or
+                        _t.SimpleNamespace(stdout="", returncode=0, stderr=""))
+    remote.bash("coach", 'echo "$HOME"; . "$X/secrets.env"')
+    assert "base64 -d | bash" in got["cmd"]                    # no fragile bash -lc "<json>"
+    decoded = _b64.b64decode(got["cmd"].split("echo ", 1)[1].split(" |", 1)[0]).decode()
+    assert decoded == 'echo "$HOME"; . "$X/secrets.env"'       # script survives verbatim

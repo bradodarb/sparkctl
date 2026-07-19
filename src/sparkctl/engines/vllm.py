@@ -45,8 +45,12 @@ def _vllm_serve_flags(svc):
 
 
 def _docker_common():
+    # secrets (sparkctl secret set ...) flow in via --env-file so vLLM authenticates to the HF Hub
+    # (gated tokenizers/config fetched at serve time); $() expands on the node. Mirrors ollama.py.
     return (f"--network host --gpus all --ipc host --ulimit memlock=-1 "
-            f"--ulimit stack=67108864 -d -v {config.CACHE}:/root/.cache/huggingface")
+            f"--ulimit stack=67108864 -d "
+            f'$(test -f "$HOME/.sparkctl/secrets.env" && echo --env-file "$HOME/.sparkctl/secrets.env") '
+            f"-v {config.CACHE}:/root/.cache/huggingface")
 
 
 def vllm_up(svc):

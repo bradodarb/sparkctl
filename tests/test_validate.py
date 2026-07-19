@@ -96,13 +96,26 @@ def test_bad_engine_is_error():
 
 
 # ---- structural + range checks ----
-def test_nvfp4_without_flashinfer_env_flagged():
+def test_nvfp4_without_flashinfer_env_is_clean():
+    # NVFP4 no longer REQUIRES the (deprecated) FlashInfer MoE env — absence must not be flagged
     recipe = {"name": "x", "services": [{
         "name": "agent", "engine": "vllm", "model": "RedHatAI/Qwen3-235B-A22B-NVFP4",
         "parallel": {"tensor": 2}, "port": 8000, "extra_args": ["--load-format=fastsafetensors"],
         "env": {"RAY_memory_monitor_refresh_ms": "0"},
     }]}
-    assert any("VLLM_USE_FLASHINFER_MOE_FP4" in m for m in _msgs(lint_recipe(recipe)))
+    assert not any("VLLM_USE_FLASHINFER_MOE_FP4" in m for m in _msgs(lint_recipe(recipe)))
+
+
+def test_flashinfer_moe_fp4_env_is_flagged_deprecated():
+    # ...and setting it IS flagged (deprecated + crashes some MoEs like Gemma-4), fixable by removal
+    recipe = {"name": "x", "services": [{
+        "name": "agent", "engine": "vllm", "model": "nvidia/Gemma-4-26B-A4B-NVFP4",
+        "node": "coach", "port": 8000, "env": {"VLLM_USE_FLASHINFER_MOE_FP4": "1"},
+    }]}
+    assert any("VLLM_USE_FLASHINFER_MOE_FP4" in m and "deprecated" in m
+               for m in _msgs(lint_recipe(recipe)))
+    _apply_all_fixes(recipe)   # --fix removes it
+    assert "VLLM_USE_FLASHINFER_MOE_FP4" not in recipe["services"][0].get("env", {})
 
 
 def test_gpu_util_out_of_range_is_error():
@@ -184,7 +197,7 @@ def test_fix_preserves_unrelated_extra_args():
                                                    "--load-format=fastsafetensors"]
 
 
-def test_fix_singlenode_and_nvfp4():
+def test_fix_singlenode_nvfp4_load_format():
     recipe = {"name": "x", "services": [{
         "name": "agent", "engine": "vllm", "model": "org/Model-NVFP4", "node": "coach", "port": 8000,
         "extra_args": ["--load-format=fastsafetensors"],
@@ -192,7 +205,7 @@ def test_fix_singlenode_and_nvfp4():
     assert _apply_all_fixes(recipe) == []
     svc = recipe["services"][0]
     assert svc["extra_args"] == ["--load-format=safetensors"]   # streamed, no eager
-    assert svc["env"]["VLLM_USE_FLASHINFER_MOE_FP4"] == "1"
+    assert "env" not in svc                                     # no deprecated FlashInfer env forced
 
 
 def test_fix_drops_vllm_only_fields_from_ollama():

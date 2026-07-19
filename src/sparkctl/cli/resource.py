@@ -5,6 +5,7 @@ mutating verb for deployments: validate -> tear down -> repoint `current` -> bri
 """
 import base64
 import json
+import re
 import shutil
 import sys
 import time
@@ -265,31 +266,49 @@ def resolve_apply_target(args):
     return args.recipe or current_recipe()
 
 
+_TEARDOWN_NOISE = ("weakref", "_del_library", "_clear_torch_ops", "_get_packet",
+                   "jit_get_operation", "atexit")
+
+
 def _crash_report(node, cname):
-    """Exit code, OOMKilled flag, and the tail of a container's logs — so a failed bring-up explains
-    itself in-line instead of just pointing the user at `sparkctl logs`."""
+    """Exit code, OOMKilled flag, the CONCRETE cause line, and a log tail. The cause is the real
+    exception vLLM logged for the engine-core failure (via its core.py error logger) — not the
+    interpreter-teardown traceback that trails it, which otherwise buries the actual reason."""
     insp = remote.on(node, f"docker inspect {cname} "
                            f"--format '{{{{.State.ExitCode}}}}|{{{{.State.OOMKilled}}}}' 2>/dev/null",
                      capture=True, check=False).stdout.strip()
     code, _, oom = insp.partition("|")
-    logs = (remote.on(node, f"docker logs --tail 20 {cname} 2>&1 | tail -20",
-                      capture=True, check=False).stdout or "").rstrip()
-    return (code or "?"), (oom.strip().lower() == "true"), logs
+    lines = (remote.on(node, f"docker logs --tail 200 {cname} 2>&1",
+                       capture=True, check=False).stdout or "").splitlines()
+    # concrete cause: last engine-core ERROR line naming an exception; skip teardown noise.
+    cause = ""
+    for ln in reversed([l for l in lines if "core.py:1165]" in l or "EngineCore failed" in l]):
+        if re.search(r"[A-Za-z_]+(Error|Exception):", ln) and not any(n in ln for n in _TEARDOWN_NOISE):
+            cause = ln.split("]", 1)[-1].strip()
+            break
+    if not cause:   # fallback: any non-teardown exception line anywhere in the tail
+        for ln in reversed(lines):
+            if re.search(r"[A-Za-z_]+(Error|Exception):", ln) and not any(n in ln for n in _TEARDOWN_NOISE):
+                cause = ln.split("]", 1)[-1].strip()
+                break
+    return (code or "?"), (oom.strip().lower() == "true"), cause, "\n".join(lines[-15:]).rstrip()
 
 
 def _fail_service(svc, node, cname, why):
     """Print an actionable crash report for one service, then exit non-zero. Called from the wait
     loop the moment a container is found dead — the deployment is not serving, say so loudly."""
-    code, oom, logs = _crash_report(node, cname)
+    code, oom, cause, tail = _crash_report(node, cname)
     print(f"[wait] ❌ {svc['name']} on {node} {why} (exit={code}, OOMKilled={oom})", flush=True)
+    if cause:
+        print(f"[wait]    cause: {cause}", flush=True)
     if oom:
         print("[wait]    → OOM during load. On unified memory the GPU reservation "
               "(gpu_memory_utilization × 128GB) and the host-side weight load share ONE pool — "
               "lower gpu_memory_utilization, drop --safetensors-load-strategy=eager, or use fewer "
               "replicas per node.", flush=True)
-    if logs:
+    if tail:
         print(f"[wait]    last log lines from {cname}:", flush=True)
-        print("\n".join("        " + ln for ln in logs.splitlines()[-20:]), flush=True)
+        print("\n".join("        " + ln for ln in tail.splitlines()), flush=True)
     sys.exit(f"[wait] deployment FAILED — '{svc['name']}' is not serving (full log: sparkctl logs {svc['name']})")
 
 

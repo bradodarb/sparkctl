@@ -69,6 +69,7 @@ def test_vllm_up_single_node(monkeypatch):
     assert "vllm serve org/M" in cmd
     assert "ray start" not in cmd                       # single-node path must not use Ray
     assert "distributed-executor-backend" not in cmd
+    assert "--env-file" in cmd and "secrets.env" in cmd  # serve container gets HF_TOKEN (auth)
 
 
 def test_vllm_up_multinode_without_fabric_exits(monkeypatch):
