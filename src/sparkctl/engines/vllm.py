@@ -44,6 +44,18 @@ def _vllm_serve_flags(svc):
     return " ".join(flags)
 
 
+def _worker_engine_flags(svc):
+    """Engine-side flags a headless mp worker needs — they must produce the SAME VllmConfig as the
+    head (model/parallel/memory/quant all have to match across ranks). The API-server flags
+    (served-name/host/port/tool+reasoning parsers) are head-only and unused under --headless."""
+    tp = svc.get("parallel", {}).get("tensor", 1)
+    pp = svc.get("parallel", {}).get("pipeline", 1)
+    flags = [f"--max-model-len {svc['max_model_len']}",
+             f"--gpu-memory-utilization {svc['gpu_memory_utilization']}",
+             f"--tensor-parallel-size {tp}", f"--pipeline-parallel-size {pp}"]
+    return " ".join(flags + svc.get("extra_args", []))
+
+
 def _docker_common():
     # secrets (sparkctl secret set ...) flow in via --env-file so vLLM authenticates to the HF Hub
     # (gated tokenizers/config fetched at serve time); $() expands on the node. Mirrors ollama.py.
@@ -70,15 +82,24 @@ def vllm_up(svc):
         print(f"[vllm] launched; watch: sparkctl logs {svc['name']}")
         return
 
-    # multinode: Ray head on HEAD + worker on WORKER, TP/PP over the fabric
+    # multinode: TP/PP across HEAD + WORKER over the CX7 fabric.
+    #   distributed_backend: ray (default, unchanged) | mp (no-Ray, vLLM-native nnodes/node-rank).
     if not config.FABRIC or config.WORKER is None:
         sys.exit(f"service '{svc['name']}' wants {world} ranks, but this cluster has no "
                  f"fabric:/second node configured — multi-node serving needs both (cluster.yaml)")
-    hn, wn = svc_cname(svc['name'], 'head'), svc_cname(svc['name'], 'worker')
     fenv = fabric_env()
     fenv.update(base_env)
     head_ip = config.NODES[config.HEAD]["fabric_ip"]
     worker_ip = config.NODES[config.WORKER]["fabric_ip"]
+    backend = svc.get("distributed_backend", "ray")
+    up = _mp_multinode_up if backend == "mp" else _ray_multinode_up
+    up(svc, model, img, serve_flags, tp, pp, world, fenv, head_ip, worker_ip)
+
+
+def _ray_multinode_up(svc, model, img, serve_flags, tp, pp, world, fenv, head_ip, worker_ip):
+    """Ray head on HEAD + worker on WORKER; the serve is a detached `docker exec` inside a
+    sleep-infinity head container (so a crashed serve doesn't tear the container down)."""
+    hn, wn = svc_cname(svc['name'], 'head'), svc_cname(svc['name'], 'worker')
     print(f"[vllm] Ray containers for '{svc['name']}' (image {img}, TP={tp} PP={pp}, world={world})")
     remote.on(config.HEAD, f"docker run {_docker_common()} --rm --name {hn} "
                            f"{env_flags({**fenv, 'VLLM_HOST_IP': head_ip})} {img} sleep infinity")
@@ -98,6 +119,33 @@ def vllm_up(svc):
     print(f"[vllm] launching: {serve}")
     # detached exec output is lost to `docker logs`; tee to a file so `logs` can follow it
     remote.on(config.HEAD, f"docker exec -d {hn} bash -lc {json.dumps(serve + ' > /tmp/vllm-serve.log 2>&1')}")
+    print(f"[vllm] launched; watch: sparkctl logs {svc['name']}")
+
+
+def _mp_multinode_up(svc, model, img, serve_flags, tp, pp, world, fenv, head_ip, worker_ip):
+    """No-Ray multinode: vLLM's native mp backend spans the fabric via --nnodes/--node-rank/
+    --master-addr. rank-0 (HEAD) runs the API server + its local worker; rank-1 (WORKER) runs
+    `--headless` (serve.py routes node_rank>0 to a workers-only MultiprocExecutor). Both containers
+    run `vllm serve` as PID 1 — so `docker logs` and container exit codes are accurate, and there's
+    no Ray daemon / plasma store / memory-monitor (the unified-memory OOM source the Ray path tunes
+    away). 1 GPU/node ⇒ nnodes == world. Weights are already mirrored to both nodes' HF cache."""
+    hn, wn = svc_cname(svc['name'], 'head'), svc_cname(svc['name'], 'worker')
+    mp = (f"--distributed-executor-backend mp --nnodes {world} "
+          f"--master-addr {head_ip} --master-port 29501")   # torch-distributed TCPStore on the fabric
+    head_serve = f"vllm serve {model} {mp} --node-rank 0 {serve_flags}"
+    worker_serve = f"vllm serve {model} {mp} --node-rank 1 --headless {_worker_engine_flags(svc)}"
+    print(f"[vllm] mp (no-Ray) multinode for '{svc['name']}' (image {img}, TP={tp} PP={pp}, world={world})")
+    # HEAD first: rank 0 binds the rendezvous store the worker connects back to. No --rm, so a crashed
+    # container survives for `docker logs` (the crash report reads it); clear any stale one first.
+    remote.on(config.HEAD,
+              f"docker rm -f {hn} >/dev/null 2>&1 || true; "
+              f"docker run {_docker_common()} --name {hn} "
+              f"{env_flags({**fenv, 'VLLM_HOST_IP': head_ip})} {img} bash -lc {json.dumps(head_serve)}")
+    time.sleep(3)
+    remote.on(config.WORKER,
+              f"docker rm -f {wn} >/dev/null 2>&1 || true; "
+              f"docker run {_docker_common()} --name {wn} "
+              f"{env_flags({**fenv, 'VLLM_HOST_IP': worker_ip})} {img} bash -lc {json.dumps(worker_serve)}")
     print(f"[vllm] launched; watch: sparkctl logs {svc['name']}")
 
 

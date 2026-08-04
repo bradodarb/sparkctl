@@ -1,0 +1,45 @@
+name: deepseek-v4-flash-mp
+description: >
+  DeepSeek-V4-Flash, TP=2 across both GB10 nodes — same model/quant/flags as deepseek-v4-flash, but
+  with the NO-RAY distribution backend (distributed_backend: mp). vLLM's native multinode: rank-0 on
+  coach runs the API server + its worker, rank-1 on ref runs `--headless`, coordinating over the CX7
+  fabric via --nnodes/--node-rank/--master-addr (no Ray daemon, plasma store, or memory monitor).
+  This is the article's approach; on GB10 unified memory it drops Ray's overhead — no
+  RAY_memory_monitor_refresh_ms tuning needed, and both containers run `vllm serve` as PID 1 so
+  `sparkctl logs`/crash reports read the serve directly. Steady-state throughput matches the Ray
+  recipe (TP all-reduce is NCCL either way); the win is lower host-memory overhead + faster/robuster
+  startup. Use deepseek-v4-flash (Ray) as the baseline; A/B this one.
+
+services:
+  - name: agent
+    engine: vllm
+    provider: hf
+    model: deepseek-ai/DeepSeek-V4-Flash
+    served_name: deepseek-v4-flash          # same served_name -> LiteLLM can pool/failover across recipes
+    parallel:
+      tensor: 2
+    distributed_backend: mp                  # no-Ray: --distributed-executor-backend mp + nnodes/node-rank
+    port: 8000
+    max_model_len: 200000
+    gpu_memory_utilization: 0.85             # 0.90 fails vLLM's startup free-mem check on GB10 (~12.7GB
+                                             # baseline in use); 0.85 fits with margin. MLA KV is tiny.
+    tool_call_parser: deepseek_v4
+    reasoning_parser: deepseek_v4
+    extra_args:
+      - --trust-remote-code
+      - --tokenizer-mode=deepseek_v4
+      - --kv-cache-dtype=fp8
+      - --enable-expert-parallel
+      # Force the BF16-activation Blackwell-native NVFP4 MoE kernel; auto-selected MARLIN SEGVs on
+      # GB10 (sm_121) and the auto list only tries the MXFP8-activation FlashInfer variant. See
+      # deepseek-v4-flash.yaml for the full reasoning. Fallbacks: triton, flashinfer_cutlass.
+      - --moe-backend=flashinfer_trtllm
+      - --block-size=256
+      - --max-num-seqs=2
+      # single quotes around the JSON: the outer SSH shell strips bare double quotes and bash
+      # brace-expands {a,b} into two --speculative-config args ("duplicate keys") otherwise.
+      - "--speculative-config='{\"method\":\"mtp\",\"num_speculative_tokens\":2}'"
+      - --load-format=fastsafetensors
+    # No env needed: the Ray memory-monitor OOM workaround (RAY_memory_monitor_refresh_ms) is moot
+    # without Ray. Fabric NCCL env (NCCL_IB_HCA/SOCKET_IFNAME/GID + VLLM_HOST_IP) is injected by the
+    # engine for both ranks, same as the Ray path.

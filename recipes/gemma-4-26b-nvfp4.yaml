@@ -10,8 +10,11 @@
 # FP4 backend, so forcing it raises NotImplementedError. Let vLLM auto-select the MoE backend.
 # Load is STREAMED
 # (no --safetensors-load-strategy=eager — eager buffers the whole checkpoint in host RAM and OOMs
-# on unified memory). reasoning_parser is intentionally omitted: Gemma-4 emits no separate reasoning
-# channel, so it would be a no-op that only risks confusing OpenAI-style harnesses.
+# on unified memory). reasoning_parser MUST be gemma4: Gemma-4 wraps its planning in a channel
+# framing (`<|channel>thought\n ...reasoning... \n<channel|>` then the final answer — see the model's
+# own chat_template.jinja). The gemma4 reasoning parser strips that thought channel into a separate
+# `reasoning` field; without it the `<|channel>thought`/`<channel|>` delimiters leak straight into
+# `content` (most visibly on the between-tool-call planning turns) and break OpenAI-style harnesses.
 name: gemma-4-26b-nvfp4
 services:
 - name: agent-coach
@@ -24,6 +27,7 @@ services:
   max_model_len: 65536
   gpu_memory_utilization: 0.85
   tool_call_parser: gemma4
+  reasoning_parser: gemma4
 - name: agent-ref
   engine: vllm
   provider: hf
@@ -34,3 +38,4 @@ services:
   max_model_len: 65536
   gpu_memory_utilization: 0.85
   tool_call_parser: gemma4
+  reasoning_parser: gemma4

@@ -35,7 +35,11 @@ class DockerBackend(Backend):
             if svc_world(svc) <= 1:
                 remote.on(svc.get("node", config.HEAD),
                           f"docker logs --tail {tail} {f}{svc_cname(svc['name'])}", check=False)
-            else:  # multinode serve runs as a detached exec -> follow its tee'd log file
+            elif svc.get("distributed_backend", "ray") == "mp":
+                # mp: `vllm serve` is the head container's PID 1 -> docker logs captures it directly
+                remote.on(config.HEAD, f"docker logs --tail {tail} {f}{svc_cname(svc['name'], 'head')}",
+                          check=False)
+            else:  # Ray: serve runs as a detached exec -> follow its tee'd log file
                 t = f"tail -n {tail}" + (" -f" if follow else "")
                 remote.on(config.HEAD, f"docker exec {svc_cname(svc['name'], 'head')} "
                                        f"{t} /tmp/vllm-serve.log", check=False)

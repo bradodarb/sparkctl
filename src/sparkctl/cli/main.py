@@ -23,11 +23,12 @@ Config is the single source of truth: cluster.yaml (topology/deploy) + recipes/*
 import argparse
 import getpass
 import json
+import os
 import sys
 
 from sparkctl import config, remote, secrets
 from sparkctl.backends import get_backend
-from sparkctl.cli import resource
+from sparkctl.cli import completion, resource
 from sparkctl.cli.create import cmd_create
 from sparkctl.cli.edit import cmd_edit
 from sparkctl.cli.validate import cmd_validate
@@ -126,6 +127,18 @@ def cmd_current(args):
     print(current_recipe())
 
 
+def _all_verbs():
+    """Every invocable verb: the argparse subcommands plus the control-machine-only verbs handled
+    before argparse (deploy/build). Introspected so completion never drifts from the real parser."""
+    sub = next(a for a in build_parser()._actions if isinstance(a, argparse._SubParsersAction))
+    return sorted(set(sub.choices) | {"deploy", "build"})
+
+
+def cmd_completion(args):
+    shell = args.shell or ("zsh" if os.environ.get("SHELL", "").endswith("zsh") else "bash")
+    print(completion.render(shell, config.ROOT, _all_verbs()))
+
+
 def cmd_secret(args):
     """set/unset write ~/.sparkctl/secrets.env (0600) and, from the control machine, sync it to
     every node. Values come from the arg or a hidden prompt — never from cluster.yaml."""
@@ -211,6 +224,9 @@ def build_parser():
     p.add_argument("value", nargs="?", help="omit to be prompted without echo")
     p.set_defaults(fn=cmd_secret)
     sub.add_parser("current").set_defaults(fn=cmd_current)
+    p = sub.add_parser("completion", help='shell completion: eval "$(sparkctl completion zsh)"')
+    p.add_argument("shell", nargs="?", choices=["bash", "zsh"], help="default: from $SHELL")
+    p.set_defaults(fn=cmd_completion)
     sub.add_parser("manifest").set_defaults(fn=cmd_manifest)
     sub.add_parser("test").set_defaults(fn=cmd_test)
     p = sub.add_parser("ctx-test"); p.add_argument("--tokens", type=int, default=30000)
@@ -228,12 +244,30 @@ def build_parser():
 
 
 # ---------------------------------------------------------------- control-machine (Mac) mode
-def build():
+def _image_targets():
+    """(tag, dockerfile) images `build` produces: the cluster default first, then any declared
+    variants from cluster.images ({tag: {dockerfile: <name in docker/>}}). Variants let a recipe pin
+    a different engine build (e.g. a newer vLLM) via a service `image:` without disturbing the fleet."""
+    targets = [(config.IMAGE, "Dockerfile")]
+    for tag, spec in (config.CFG["cluster"].get("images") or {}).items():
+        targets.append((tag, (spec or {}).get("dockerfile", "Dockerfile")))
+    return targets
+
+
+def build(only=None):
+    targets = _image_targets()
+    if only:
+        targets = [(t, df) for t, df in targets if t == only]
+        if not targets:
+            known = ", ".join(t for t, _ in _image_targets())
+            sys.exit(f"[build] unknown image '{only}' — declare it under cluster.images "
+                     f"(known: {known})")
     for node in config.NODES:
         a = remote.node_addr(node)
-        print(f"[build] {node} -> {config.IMAGE}")
-        remote.sh(f"ssh {config.USER}@{a} 'docker build -t {config.IMAGE} "
-                  f"-f {config.REMOTE}/docker/Dockerfile {config.REMOTE}/docker'")
+        for tag, dockerfile in targets:
+            print(f"[build] {node} -> {tag} ({dockerfile})")
+            remote.sh(f"ssh {config.USER}@{a} 'docker build -t {tag} "
+                      f"-f {config.REMOTE}/docker/{dockerfile} {config.REMOTE}/docker'")
 
 
 def run_node(node, argv):
@@ -257,7 +291,8 @@ def launch_pull_queue_on_head(recipes):
 
 # Verbs that run directly on the control machine (they SSH per node as needed) — no deploy.
 # `create`/`edit` only touch the repo's cluster.yaml / recipes/ — purely local, never the nodes.
-LOCAL_VERBS = ("get", "describe", "top", "current", "secret", "create", "edit", "validate")
+LOCAL_VERBS = ("get", "describe", "top", "current", "secret", "create", "edit", "validate",
+               "completion")
 # Mutating verbs push the repo to the nodes first, then run on the head.
 DEPLOY_VERBS = ("apply", "delete", "stop", "pull", "mirror", "build")
 
@@ -270,7 +305,7 @@ def control_main(argv):
     if cmd == "deploy":
         return deploy_init() if "--init" in argv else deploy()
     if cmd == "build":
-        deploy(); return build()
+        deploy(); return build(argv[1] if len(argv) > 1 else None)
     if cmd == "pull-queue":
         deploy(); return launch_pull_queue_on_head(argv[1:])
     if cmd in LOCAL_VERBS:

@@ -38,6 +38,7 @@ if "gateway" in CFG or "metrics" in CFG:
 SERVER = CFG.get("server", {})
 HEAD = CFG["cluster"]["head"]
 IMAGE = CFG["cluster"]["container_image"]
+IMAGES = {IMAGE, *(CFG["cluster"].get("images") or {})}   # buildable image tags: default + variants
 CACHE = CFG["cluster"]["model_cache"]
 NODES = CFG["nodes"]
 FABRIC = CFG.get("fabric", {})       # optional: single-node clusters have no inter-node fabric

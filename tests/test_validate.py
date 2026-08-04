@@ -52,6 +52,62 @@ def test_correct_multinode_recipe_is_clean():
     assert lint_recipe(recipe) == []
 
 
+def test_mp_backend_multinode_needs_no_ray_env():
+    # distributed_backend: mp -> no Ray, so RAY_memory_monitor_refresh_ms is NOT required (and absent = clean)
+    recipe = {"name": "ok", "services": [{
+        "name": "agent", "engine": "vllm", "model": "some/model",
+        "parallel": {"tensor": 2}, "distributed_backend": "mp", "port": 8000,
+        "extra_args": ["--load-format=fastsafetensors"],
+    }]}
+    assert lint_recipe(recipe) == []
+
+
+def test_mp_backend_with_ray_env_is_info():
+    recipe = {"name": "x", "services": [{
+        "name": "agent", "engine": "vllm", "model": "m",
+        "parallel": {"tensor": 2}, "distributed_backend": "mp", "port": 8000,
+        "extra_args": ["--load-format=fastsafetensors"],
+        "env": {"RAY_memory_monitor_refresh_ms": "0"},
+    }]}
+    assert any("no effect with distributed_backend=mp" in m for m in _msgs(lint_recipe(recipe), "info"))
+    _apply_all_fixes(recipe)
+    assert "RAY_memory_monitor_refresh_ms" not in recipe["services"][0].get("env", {})
+
+
+def test_mp_backend_on_singlenode_is_flagged():
+    recipe = {"name": "x", "services": [{
+        "name": "agent", "engine": "vllm", "model": "m", "node": "coach", "port": 8000,
+        "distributed_backend": "mp", "extra_args": ["--load-format=safetensors"],
+    }]}
+    assert any("only applies to multinode" in m for m in _msgs(lint_recipe(recipe), "warn"))
+    _apply_all_fixes(recipe)
+    assert "distributed_backend" not in recipe["services"][0]
+
+
+def test_invalid_distributed_backend_is_error():
+    recipe = {"name": "x", "services": [{
+        "name": "agent", "engine": "vllm", "model": "m",
+        "parallel": {"tensor": 2}, "distributed_backend": "slurm", "port": 8000,
+        "extra_args": ["--load-format=fastsafetensors"],
+    }]}
+    assert any("distributed_backend must be" in m for m in _msgs(lint_recipe(recipe), "error"))
+
+
+def test_undeclared_pinned_image_is_flagged():
+    recipe = {"name": "x", "services": [{
+        "name": "agent", "engine": "vllm", "model": "m", "node": "coach", "port": 8000,
+        "image": "csv-vllm:0.99-experimental", "extra_args": ["--load-format=safetensors"],
+    }]}
+    known = {"csv-vllm:26.06-ray"}
+    assert any("pinned image" in m and "not the cluster default" in m
+               for m in _msgs(lint_recipe(recipe, known_images=known), "warn"))
+    # declared/default image -> no image warning; and no check at all when known_images is omitted
+    ok = dict(recipe["services"][0], image="csv-vllm:26.06-ray")
+    assert not any("pinned image" in m for m in _msgs(lint_recipe({"name": "x", "services": [ok]},
+                                                                   known_images=known)))
+    assert not any("pinned image" in m for m in _msgs(lint_recipe(recipe)))   # no known_images -> skip
+
+
 def test_multinode_pinned_node_is_flagged():
     recipe = {"name": "x", "services": [{
         "name": "agent", "engine": "vllm", "model": "m", "node": "coach",
@@ -116,6 +172,28 @@ def test_flashinfer_moe_fp4_env_is_flagged_deprecated():
                for m in _msgs(lint_recipe(recipe)))
     _apply_all_fixes(recipe)   # --fix removes it
     assert "VLLM_USE_FLASHINFER_MOE_FP4" not in recipe["services"][0].get("env", {})
+
+
+def test_gemma4_tool_parser_without_reasoning_parser_is_flagged():
+    # the silent bug: gemma4 tool parser handles tool calls but not the thought channel, which then
+    # leaks into content. Flag it, and --fix pairs the reasoning parser.
+    recipe = {"name": "x", "services": [{
+        "name": "agent-coach", "engine": "vllm", "model": "nvidia/Gemma-4-26B-A4B-NVFP4",
+        "node": "coach", "port": 8000, "extra_args": ["--load-format=safetensors"],
+        "tool_call_parser": "gemma4",
+    }]}
+    assert any("reasoning_parser" in m and "leak" in m for m in _msgs(lint_recipe(recipe), "warn"))
+    _apply_all_fixes(recipe)
+    assert recipe["services"][0]["reasoning_parser"] == "gemma4"
+
+
+def test_gemma4_both_parsers_is_clean():
+    recipe = {"name": "x", "services": [{
+        "name": "agent-coach", "engine": "vllm", "model": "nvidia/Gemma-4-26B-A4B-NVFP4",
+        "node": "coach", "port": 8000, "extra_args": ["--load-format=safetensors"],
+        "tool_call_parser": "gemma4", "reasoning_parser": "gemma4",
+    }]}
+    assert lint_recipe(recipe) == []
 
 
 def test_gpu_util_out_of_range_is_error():

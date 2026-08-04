@@ -353,6 +353,30 @@ def _wait_ready(recipe, timeout):
     print(f"[wait] deployment ready in {time.time() - t0:.0f}s ✅")
 
 
+def _ensure_images(recipe):
+    """Fail early — before tearing down the running deployment — if a service pins an `image:` that
+    isn't built on a node it will run on. Presence-only: variant images are built explicitly with
+    `sparkctl build <image>`; we never auto-pull/build mid-apply (a silent pull of the wrong thing is
+    worse than a clear stop). The cluster default image is a build/deploy invariant, so skip it."""
+    missing = []
+    for svc in recipe["services"]:
+        if svc["engine"] != "vllm":
+            continue
+        img = svc.get("image", config.IMAGE)
+        if img == config.IMAGE:
+            continue
+        nodes = [config.HEAD, config.WORKER] if svc_world(svc) > 1 else [svc.get("node", config.HEAD)]
+        for node in [n for n in nodes if n]:
+            if remote.on(node, f"docker image inspect {img} >/dev/null 2>&1",
+                         check=False, capture=True).returncode != 0:
+                missing.append((node, img))
+    if missing:
+        for node, img in missing:
+            print(f"[apply] ❌ pinned image '{img}' not found on {node}", flush=True)
+        tag = sorted({img for _, img in missing})[0]
+        sys.exit(f"[apply] build it first: sparkctl build {tag}")
+
+
 def cmd_apply(args):
     # --boot is the systemd auto-restore path; a human `apply` never carries it, so human intent
     # always wins (re-arms boot, ignores the disarm markers).
@@ -373,6 +397,7 @@ def cmd_apply(args):
 
     name = resolve_apply_target(args)
     recipe = load_recipe(name)         # validate before tearing anything down
+    _ensure_images(recipe)             # a pinned variant image must exist before we stop the old one
     ensure_models(recipe)              # pull-if-missing: nodes -> NAS -> download, verified
     _services_down()
     (config.ROOT / "current").write_text(name + "\n")

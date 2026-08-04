@@ -65,9 +65,10 @@ def _drop_eager(svc):
 
 
 # ---------------------------------------------------------------- the linter
-def lint_recipe(recipe, *, known_nodes=None, head=None):
+def lint_recipe(recipe, *, known_nodes=None, head=None, known_images=None):
     """Return a list of Finding for one recipe dict. Pass known_nodes/head from config to enable
-    node-existence and port-collision checks; omit them to skip those. Pure except that a Finding's
+    node-existence and port-collision checks; pass known_images (buildable tags) to flag a service
+    pinning an undeclared `image:`; omit any to skip that check. Pure except that a Finding's
     `fix()` closure, if later invoked, mutates the passed-in recipe."""
     out = []
 
@@ -144,9 +145,13 @@ def lint_recipe(recipe, *, known_nodes=None, head=None):
                     "remove --safetensors-load-strategy=eager (vLLM streams shards by default)",
                     fix=lambda s=svc: _drop_eager(s))
 
-            if world >= 2:  # multinode: runs on the Ray head, tensor-parallel over the fabric
+            backend = svc.get("distributed_backend", "ray")
+            if backend not in ("ray", "mp"):
+                add(ERROR, f"{label}: distributed_backend must be 'ray' or 'mp' (got {backend!r})",
+                    "set distributed_backend: ray  (or distributed_backend: mp)")
+            if world >= 2:  # multinode: serves from the head node, tensor-parallel over the fabric
                 if node:
-                    add(WARN, f"{label}: parallel.tensor>=2 runs on the Ray head; pinned 'node: {node}' is ignored",
+                    add(WARN, f"{label}: parallel.tensor>=2 serves from the head node; pinned 'node: {node}' is ignored",
                         "remove 'node:' for a multinode service",
                         fix=lambda s=svc: s.pop("node", None))
                 if not has_fast:
@@ -154,12 +159,22 @@ def lint_recipe(recipe, *, known_nodes=None, head=None):
                         f"single-node load flags don't auto-disable GDS/cuFile and can crash on load",
                         "set extra_args load-format to --load-format=fastsafetensors",
                         fix=lambda s=svc: _rewrite_load_format(s, multinode=True))
-                if not ray_off:
+                if backend == "ray" and not ray_off:
                     add(WARN, f"{label}: multinode on unified memory needs env RAY_memory_monitor_refresh_ms: \"0\" "
                         f"or Ray's memory monitor will OOM-kill the TP workers during load",
                         'add env RAY_memory_monitor_refresh_ms: "0"',
                         fix=lambda s=svc: _set_env(s, "RAY_memory_monitor_refresh_ms", "0"))
+                if backend == "mp" and "RAY_memory_monitor_refresh_ms" in env:
+                    add(INFO, f"{label}: RAY_memory_monitor_refresh_ms has no effect with distributed_backend=mp "
+                        f"(no Ray daemon runs)",
+                        "remove env RAY_memory_monitor_refresh_ms",
+                        fix=lambda s=svc: _del_env(s, "RAY_memory_monitor_refresh_ms"))
             else:  # single-node
+                if backend == "mp":
+                    add(WARN, f"{label}: distributed_backend only applies to multinode (tensor>=2); "
+                        f"single-node ignores it",
+                        "remove distributed_backend",
+                        fix=lambda s=svc: s.pop("distributed_backend", None))
                 if has_fast:
                     add(WARN, f"{label}: fastsafetensors is the multinode/GDS path (auto-disables only when world>1); "
                         f"single-node should use plain --load-format=safetensors (streamed)",
@@ -170,6 +185,14 @@ def lint_recipe(recipe, *, known_nodes=None, head=None):
                         "remove env RAY_memory_monitor_refresh_ms",
                         fix=lambda s=svc: _del_env(s, "RAY_memory_monitor_refresh_ms"))
 
+            # A pinned image must be buildable (the cluster default or a declared cluster.images
+            # variant) — otherwise `sparkctl apply` stops at the presence preflight. Static WARN: the
+            # image could still be hand-built on the nodes, so don't hard-error.
+            if known_images is not None and svc.get("image") and svc["image"] not in known_images:
+                add(WARN, f"{label}: pinned image '{svc['image']}' is not the cluster default nor a "
+                    f"declared cluster.images variant — apply will fail unless it's built on the nodes",
+                    "declare it under cluster.images then `sparkctl build <image>`, or drop image:")
+
             # VLLM_USE_FLASHINFER_MOE_FP4 is deprecated in vLLM >= 0.22 and model-specific: some NVFP4
             # MoEs (e.g. Gemma-4) have no FlashInfer FP4 backend, so forcing it raises
             # NotImplementedError at load. Don't mandate it — flag it as a likely-broken setting.
@@ -178,6 +201,16 @@ def lint_recipe(recipe, *, known_nodes=None, head=None):
                     f"by some NVFP4 MoEs (Gemma-4 -> NotImplementedError at load); let vLLM auto-select instead",
                     "remove env VLLM_USE_FLASHINFER_MOE_FP4 (or use --moe-backend for a specific kernel)",
                     fix=lambda s=svc: _del_env(s, "VLLM_USE_FLASHINFER_MOE_FP4"))
+
+            # Gemma-4 frames its planning in a thought channel (`<|channel>thought ... <channel|>`).
+            # The gemma4 tool_call_parser handles tool calls but NOT that reasoning channel — without a
+            # matching reasoning_parser the channel delimiters leak into `content` (silently: loads and
+            # serves fine, but breaks OpenAI-style harnesses). If you use the gemma4 tool parser, pair it.
+            if svc.get("tool_call_parser") == "gemma4" and svc.get("reasoning_parser") != "gemma4":
+                add(WARN, f"{label}: tool_call_parser=gemma4 without reasoning_parser=gemma4 — Gemma-4's "
+                    f"thought channel (<|channel>thought ... <channel|>) will leak into content",
+                    "add reasoning_parser: gemma4",
+                    fix=lambda s=svc: s.__setitem__("reasoning_parser", "gemma4"))
 
         # cross-service / topology checks (both engines)
         if node and known_nodes and node not in known_nodes:
@@ -244,7 +277,7 @@ def cmd_validate(args):
     for name in names:
         path = config.ROOT / "recipes" / f"{name}.yaml"
         recipe = load_recipe(name)   # exits with a clear message if a named recipe is missing
-        findings = lint_recipe(recipe, known_nodes=kn, head=head)
+        findings = lint_recipe(recipe, known_nodes=kn, head=head, known_images=config.IMAGES)
         print(f"recipe: {name}")
         for line in format_findings(findings):
             print(line)
@@ -255,7 +288,7 @@ def cmd_validate(args):
                 f.fix()
             if fixable:
                 path.write_text(_dump_recipe(recipe, path.read_text()))
-                findings = lint_recipe(recipe, known_nodes=kn, head=head)   # re-lint the fixed dict
+                findings = lint_recipe(recipe, known_nodes=kn, head=head, known_images=config.IMAGES)   # re-lint the fixed dict
                 total_fixed += len(fixable)
                 print(f"  🔧 applied {len(fixable)} fix(es) -> {path}")
                 manual = [f for f in findings if not f.fix]

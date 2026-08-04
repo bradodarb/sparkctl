@@ -62,6 +62,76 @@ def test_apply_waits_by_default_and_detach_opts_out(tmp_root, monkeypatch):
     assert "--detach" in calls[1]                            # opt-out is forwarded to the head
 
 
+# ---- shell completion --------------------------------------------------------
+def test_completion_render_zsh_and_bash():
+    from sparkctl.cli import completion
+    verbs = ["apply", "validate", "deploy", "build"]
+    zsh = completion.render("zsh", "/repo", verbs)
+    assert "compdef _sparkctl sparkctl" in zsh
+    assert 'root="/repo"' in zsh and "${root}/recipes/*.yaml" in zsh
+    assert "apply|validate|pull|pull-queue) compadd" in zsh   # RECIPE_VERBS injected into the case
+    assert "edit) compadd -- $recipes cluster" in zsh
+    bash = completion.render("bash", "/repo", verbs)
+    assert "complete -F _sparkctl sparkctl" in bash
+    assert "apply validate deploy build" in bash             # verbs space-joined into compgen -W
+
+
+def test_all_verbs_covers_parser_and_control_verbs():
+    v = main._all_verbs()
+    # subcommands + the pre-argparse control verbs both show up, so completion never drifts
+    assert {"apply", "validate", "pull", "completion", "deploy", "build"} <= set(v)
+
+
+def test_completion_command_defaults_shell_from_env(monkeypatch, capsys):
+    monkeypatch.setenv("SHELL", "/usr/bin/zsh")
+    main.cmd_completion(SimpleNamespace(shell=None))
+    assert "compdef _sparkctl sparkctl" in capsys.readouterr().out
+
+
+# ---- multi-image build + preflight -------------------------------------------
+def test_build_default_image_on_all_nodes(monkeypatch):
+    cmds = []
+    monkeypatch.setattr(remote, "sh", lambda c, **k: cmds.append(c))
+    monkeypatch.setattr(remote, "node_addr", lambda n: f"{n}.addr")
+    main.build()
+    assert sum(f"docker build -t {config.IMAGE} " in c for c in cmds) == len(config.NODES)
+    assert all("-f " in c and "/docker/Dockerfile " in c for c in cmds)
+
+
+def test_image_targets_includes_declared_variants(monkeypatch):
+    monkeypatch.setitem(config.CFG["cluster"], "images",
+                        {"csv-vllm:0.25": {"dockerfile": "Dockerfile.v025"}})
+    targets = dict(main._image_targets())
+    assert targets[config.IMAGE] == "Dockerfile"           # default always first
+    assert targets["csv-vllm:0.25"] == "Dockerfile.v025"   # variant with its own dockerfile
+
+
+def test_build_unknown_image_exits(monkeypatch):
+    monkeypatch.setattr(remote, "sh", lambda c, **k: None)
+    monkeypatch.setattr(remote, "node_addr", lambda n: "a")
+    with pytest.raises(SystemExit, match="unknown image"):
+        main.build("csv-vllm:does-not-exist")
+
+
+def test_ensure_images_missing_pinned_exits(monkeypatch):
+    monkeypatch.setattr(remote, "on", lambda node, cmd, **k: SimpleNamespace(returncode=1))
+    recipe = {"name": "r", "services": [{"name": "a", "engine": "vllm", "model": "m",
+              "node": config.HEAD, "image": "csv-vllm:nope",
+              "max_model_len": 1, "gpu_memory_utilization": 0.5}]}
+    with pytest.raises(SystemExit, match="build it first"):
+        resource._ensure_images(recipe)
+
+
+def test_ensure_images_default_image_skips_inspect(monkeypatch):
+    called = []
+    monkeypatch.setattr(remote, "on",
+                        lambda node, cmd, **k: called.append(cmd) or SimpleNamespace(returncode=0))
+    recipe = {"name": "r", "services": [{"name": "a", "engine": "vllm", "model": "m",
+              "node": config.HEAD, "max_model_len": 1, "gpu_memory_utilization": 0.5}]}
+    resource._ensure_images(recipe)   # cluster-default image is a build/deploy invariant -> no probe
+    assert called == []
+
+
 class WaitBackend:
     def __init__(self, bases=("http://n1:8000/v1", "http://n2:8000/v1"), running=True):
         self.bases, self.running = list(bases), running

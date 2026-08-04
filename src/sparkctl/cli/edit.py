@@ -76,7 +76,8 @@ def cmd_edit(args):
         # a hand-edit is exactly where flag/parallel couplings get out of sync — lint before serving
         from sparkctl.cli.validate import format_findings, lint_recipe
         findings = lint_recipe(yaml.safe_load(after),
-                               known_nodes=set(config.NODES), head=config.HEAD)
+                               known_nodes=set(config.NODES), head=config.HEAD,
+                               known_images=config.IMAGES)
         lint_warnings = [f for f in findings if f.level != "info"]
         if lint_warnings:
             print("[edit] validation flagged issues:")

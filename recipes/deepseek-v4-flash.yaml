@@ -1,0 +1,63 @@
+name: deepseek-v4-flash
+description: >
+  DeepSeek-V4-Flash (official checkpoint: FP8 block for linear/attention + FP4 MoE experts, ~150GB),
+  tensor-parallel across both GB10 nodes over the CX7 fabric. Reproduces NVIDIA's DGX Spark 2-node
+  recipe (TP=2, MTP speculative decode, 200K ctx) — but on STOCK upstream vLLM, no fork. The May
+  forum post needed jasl/vllm; since then DeepSeek-V4 landed in mainline, and our csv-vllm:26.06-ray
+  image (vLLM 0.22.1) already ships every piece: DeepseekV4ForCausalLM + DeepSeekV4MTPModel and the
+  deepseek_v4 tokenizer-mode / tool-call / reasoning parsers.
+  #
+  # Memory: FP8+FP4 weights ~150GB split TP=2 -> ~75GB/node of 128GB unified. Fits because DeepSeek
+  # uses MLA (Multi-head Latent Attention) — the KV cache is tiny, which is what makes 200K ctx on two
+  # Sparks viable. --max-num-seqs 2 is intentional at 200K: concurrency is traded for context depth.
+  #
+  # Distribution backend: Ray path (ships today, same as qwen3-235b). An mp / no-Ray variant
+  # (--distributed-executor-backend mp) is the planned follow-up — see deepseek-v4-flash-mp.yaml.
+  #
+  # Tuning knobs (start conservative, then push once a clean bringup is confirmed):
+  #   - gpu_memory_utilization: raise toward 0.92 for more KV headroom; lower if it OOMs at KV setup.
+  #   - num_speculative_tokens: 2 is the Spark-validated MTP value (~68% accept); official recipe uses 3.
+  #   - compilation-config cudagraph_mode=FULL_AND_PIECEWISE: the article's throughput setting; omitted
+  #     here to keep first bringup simple (vLLM defaults to piecewise). Add via extra_args once stable.
+
+services:
+  - name: agent
+    engine: vllm
+    provider: hf
+    model: deepseek-ai/DeepSeek-V4-Flash
+    served_name: deepseek-v4-flash
+    parallel:
+      tensor: 2                              # TP=2: one rank per GB10 node, all-reduce over CX7/NCCL
+    port: 8000
+    max_model_len: 200000                    # 200K ctx (MLA keeps KV small enough to fit)
+    gpu_memory_utilization: 0.85             # 0.90 tripped vLLM's startup free-memory check (~12.7GB
+                                             # baseline already used -> 0.90*121.7=109.5 > 108.99 free);
+                                             # 0.85 fits with margin. MLA KV is tiny, so 200K still fits.
+    tool_call_parser: deepseek_v4            # -> --enable-auto-tool-choice --tool-call-parser deepseek_v4
+    reasoning_parser: deepseek_v4
+    extra_args:
+      - --trust-remote-code                  # DeepSeek-V4 ships custom modeling code
+      - --tokenizer-mode=deepseek_v4         # V4's native tokenizer mode (present in ModelConfig)
+      - --kv-cache-dtype=fp8                 # halves KV footprint; required to reach 200K here
+      - --enable-expert-parallel             # EP for the MoE experts across the two ranks
+      # MoE backend for the FP4 experts. vLLM's DeepSeek-V4 auto-priority is TRTLLM-MXFP8 -> DeepGEMM
+      # -> MARLIN; it only tries the FlashInfer variant needing MXFP8 *activation* (this model uses
+      # BF16 activation), so it declines that and falls to MARLIN — whose prebuilt kernels SEGV on GB10
+      # (sm_121). Forcing the flashinfer_trtllm *family* makes the selector try TRTLLM_MXFP4_BF16 first
+      # (BF16-activation, Blackwell-native NVFP4 — has_flashinfer_b12x_moe is True on this GPU, and it's
+      # gpt-oss's #1 Blackwell backend). (triton_unfused is ROCm-only + has an MTP bug; triton/
+      # flashinfer_cutlass are the fallbacks if this declines.)
+      - --moe-backend=flashinfer_trtllm
+      - --block-size=256                     # article/official DeepSeek-V4 block size
+      - --max-num-seqs=2                     # intentional low concurrency at 200K ctx (KV budget)
+      # NOTE the single quotes around the JSON: without them the outer SSH shell strips the double
+      # quotes and bash brace-expands {a,b} into two --speculative-config args ("duplicate keys").
+      - "--speculative-config='{\"method\":\"mtp\",\"num_speculative_tokens\":2}'"  # MTP draft (DeepSeekV4MTPModel)
+      # fastsafetensors: DGX Spark mmap is pathologically slow (NVIDIA forum t/349886) and eager
+      # buffers the whole 150GB checkpoint in host RAM (OOM on unified mem). fastsafetensors streams
+      # and auto-uses nogds for TP>1. Same choice as qwen3-235b.
+      - --load-format=fastsafetensors
+    env:
+      # GB10 unified memory: weights+KV count as system RAM, so Ray's default ~95% memory monitor
+      # spuriously OOM-kills TP workers at load/KV setup. Disable it (same fix as qwen3-235b/minimax).
+      RAY_memory_monitor_refresh_ms: "0"

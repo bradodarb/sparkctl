@@ -90,3 +90,52 @@ def test_vllm_up_multinode_uses_ray(monkeypatch):
     assert "--tensor-parallel-size 2" in cmds
     # head + worker containers land on different nodes
     assert {n for n, _ in calls} >= {config.HEAD, config.WORKER}
+
+
+# ---- mp (no-Ray) multinode ------------------------------------------------
+def test_worker_engine_flags_are_engine_only():
+    f = vllm._worker_engine_flags(_svc(parallel={"tensor": 2}, served_name="M", port=8000,
+                                       tool_call_parser="deepseek_v4", reasoning_parser="deepseek_v4",
+                                       extra_args=["--kv-cache-dtype=fp8", "--trust-remote-code"]))
+    # engine config the worker must mirror
+    assert "--tensor-parallel-size 2" in f
+    assert "--max-model-len 4096" in f
+    assert "--kv-cache-dtype=fp8" in f and "--trust-remote-code" in f
+    # API-server flags are head-only — never on the headless worker
+    assert "--served-model-name" not in f
+    assert "--host" not in f and "--port" not in f
+    assert "--tool-call-parser" not in f and "--reasoning-parser" not in f
+
+
+def test_vllm_up_multinode_mp_no_ray(monkeypatch):
+    calls = []
+    monkeypatch.setattr(remote, "on", lambda node, cmd, **k: calls.append((node, cmd)))
+    monkeypatch.setattr(vllm.time, "sleep", lambda *_: None)
+    vllm.vllm_up(_svc(parallel={"tensor": 2}, port=8000, distributed_backend="mp"))
+    by_node = {}
+    for n, c in calls:
+        by_node.setdefault(n, []).append(c)
+    allcmds = " ".join(c for _, c in calls)
+    # no Ray anywhere on the mp path
+    assert "ray start" not in allcmds
+    assert "--distributed-executor-backend mp" in allcmds
+    assert "--nnodes 2" in allcmds
+    assert "--master-addr" in allcmds
+    # rank-0 API server on HEAD, headless rank-1 worker on WORKER
+    head = " ".join(by_node[config.HEAD])
+    worker = " ".join(by_node[config.WORKER])
+    assert "--node-rank 0" in head and "--served-model-name M" in head
+    assert "--node-rank 1" in worker and "--headless" in worker
+    assert "vllm serve org/M" in head and "vllm serve org/M" in worker
+    # both run vllm serve as PID 1 (no sleep-infinity + exec)
+    assert "sleep infinity" not in allcmds
+
+
+def test_vllm_up_multinode_defaults_to_ray_not_mp(monkeypatch):
+    calls = []
+    monkeypatch.setattr(remote, "on", lambda node, cmd, **k: calls.append((node, cmd)))
+    monkeypatch.setattr(vllm.time, "sleep", lambda *_: None)
+    vllm.vllm_up(_svc(parallel={"tensor": 2}, port=8000))   # no distributed_backend key
+    allcmds = " ".join(c for _, c in calls)
+    assert "ray start --head" in allcmds
+    assert "--distributed-executor-backend mp" not in allcmds
