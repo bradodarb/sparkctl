@@ -60,6 +60,8 @@ download:
                                   #   xet-backed repos; sets HF_XET_HIGH_PERFORMANCE=1). Was off by
                                   #   default for stall bugs, but the stall_timeout watchdog now
                                   #   kills+resumes any hang, so try `true` if downloads are slow.
+                                  #   Either way, a model with a file over 50GB (hf's plain-HTTP cap)
+                                  #   switches to xet automatically for that download.
   # max_workers: 8                # optional: parallel shard downloads (`hf download --max-workers`).
                                   #   Helps when per-connection throughput is throttled. Omit = 1.
   request_timeout: 60             # HF_HUB_DOWNLOAD_TIMEOUT (s)

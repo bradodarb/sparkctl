@@ -88,11 +88,21 @@ services:
     model: <hf-repo>             # NVFP4 preferred (Blackwell-native)
     served_name: <api-name>
     node: coach                  # OPTIONAL: pin single-node serve (omit for TP=2 multinode)
+    # nodes: [coach, ref]        # OPTIONAL alt to node:: fan out one single-node replica per node,
+                                 #   same served_name -> gateway load-balances them (mutually excl. w/ node:)
     parallel: { tensor: 1 }      # 1 = single-node; 2 = across both nodes (Ray over the fabric)
     port: 8000
     max_model_len: 65536
     gpu_memory_utilization: 0.85
     tool_call_parser: qwen3_coder     # + reasoning_parser, extra_args: [...], env: {...}
+    # ── vision-language (VLM) models ──
+    multimodal: true                  # declares vision capability to the gateway (supports_vision)
+    limit_mm_per_prompt: { image: 4 } # max media/request -> --limit-mm-per-prompt (dict, not string)
+    mm_processor_kwargs: { }          # -> --mm-processor-kwargs (dict)
+    trust_remote_code: true           # first-class -> --trust-remote-code (was a raw extra_args flag)
+    model_impl: transformers          # auto|vllm|transformers; use transformers for archs vLLM lacks
+    tool_parser_plugin: /opt/sparkctl-plugins/atem_tool_parser.py  # load a custom out-of-tree
+                                      # ToolParser (baked into the image); select it via tool_call_parser
   - name: embeddings
     engine: ollama
     node: ref
@@ -102,10 +112,20 @@ services:
 
 - **Single-node** (`tensor: 1` + `node:`) — one `vllm serve`, no Ray. Replicate the same
   `served_name` on both nodes for two concurrent agents behind one endpoint.
+- **Replicated** (`tensor: 1` + `nodes: [coach, ref]`) — sugar for the above: one service block
+  fans out to a single-node replica per node (`<name>-<node>`), sharing one `served_name` so the
+  gateway round-robins across them. Each replica must fit on one node. Tune with `server.routing_strategy`.
 - **Multi-node** (`tensor: 2`, no `node:`) — Ray head+worker, tensor-parallel over the fabric, one
   endpoint on the head. For models too big for one node.
 
 `sparkctl apply -f my-recipe.yaml` copies a manifest into `recipes/` and deploys it.
+
+**Pinned images.** A recipe may pin a non-default `image:`. Declare it once under `cluster.images`
+as either built (`{tag: {dockerfile: <name in docker/>}}`) or pulled
+(`{tag: {pull: <registry-ref>}}`, e.g. an official upstream image with native support for a new
+arch). `apply` auto-provisions a declared-but-missing image (builds or pulls it, before touching the
+running deployment); an *undeclared* pinned image is a hard stop. `sparkctl build [tag]` still
+builds/pulls ahead of time if you prefer.
 
 ## Backends
 

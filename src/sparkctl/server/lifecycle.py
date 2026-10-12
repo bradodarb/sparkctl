@@ -10,6 +10,7 @@ commands; whether metrics/grafana run is declared in cluster.yaml."""
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import sys
 import time
@@ -104,13 +105,19 @@ def serve_start(foreground=False, wait=False):
         from sparkctl.server.__main__ import main as run_server
         return run_server()
     py = Path(sys.executable) if _have_server_deps() else _ensure_venv()
+    # `python -m sparkctl.server` needs `sparkctl` importable. In a source checkout it's NOT installed
+    # into `py` (only bin/sparkctl injects src onto sys.path), so put src on PYTHONPATH for the spawned
+    # process — else it dies with ModuleNotFoundError and leaves a stale pidfile. Harmless when
+    # pip-installed (a non-existent src/ is ignored and sparkctl resolves from site-packages).
+    src = config.ROOT / "src"
+    pythonpath = os.pathsep.join(p for p in (str(src), os.environ.get("PYTHONPATH", "")) if p)
     if foreground:                          # deps live in the venv — re-exec into it
         _grafana_up_if_enabled()
-        env = {**os.environ, "SPARKCTL_ROOT": str(config.ROOT)}
+        env = {**os.environ, "SPARKCTL_ROOT": str(config.ROOT), "PYTHONPATH": pythonpath}
         os.execve(str(py), [str(py), "-m", "sparkctl.server"], env)
     SRV_DIR.mkdir(parents=True, exist_ok=True)
-    remote.sh(f"SPARKCTL_ROOT={config.ROOT} nohup {py} -m sparkctl.server "
-              f"> {SRV_LOG} 2>&1 & echo $! > {SRV_PID}", check=False)
+    remote.sh(f"SPARKCTL_ROOT={config.ROOT} PYTHONPATH={shlex.quote(pythonpath)} "
+              f"nohup {py} -m sparkctl.server > {SRV_LOG} 2>&1 & echo $! > {SRV_PID}", check=False)
     _grafana_up_if_enabled()
     where = "local" if config.SELF is None else config.SELF
     print(f"[server] up on {where}:{port} (mode: local) — /v1 /metrics /dash /healthz")
@@ -181,11 +188,23 @@ def server_running():
                            capture=True).stdout or "").strip())
 
 
-def refresh_server_if_running():
-    """If the unified server is running here, restart it so its LiteLLM routes + scrape targets
-    match the new deployment (post-apply)."""
+def _is_server_host():
+    """True if the unified server is meant to run on THIS machine — either server.host is 'local'
+    and we're the dev machine (config.SELF is None), or server.host names the node we're on."""
+    host = config.SERVER.get("host", "local")
+    return (host == "local" and config.SELF is None) or host == config.SELF
+
+
+def refresh_or_start_server():
+    """Post-apply: make the unified server reflect the new deployment. If it's already running here,
+    restart it (so LiteLLM routes + scrape targets match the new recipe); if it's down but this
+    machine is the designated server host, START it — an apply with no gateway serving nothing is a
+    footgun. No-op on machines that don't host the server (e.g. the head when host is 'local')."""
     if server_running():
         print("[server] running — restarting for the new deployment")
+        serve_start()
+    elif _is_server_host():
+        print("[server] not running — starting it for the new deployment")
         serve_start()
 
 

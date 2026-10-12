@@ -1,0 +1,116 @@
+# Tres amigos — three models, one instance each, across both nodes (no replicas / no load-balancing).
+#
+#   coach : Qwen3.8-Flash-Next NVFP4 (SGLang)  — owns the node: ~81GB resident weights + ~16GB KV
+#   ref   : Qwen3.8-27B NVFP4 (vLLM, :8000)    — gpu_memory_utilization 0.40 (~48GiB: 15GB wts + KV)
+#           Nemotron-3.5-Lightning (vLLM, :8001) — gpu_memory_utilization 0.40 (~48GiB: 21GB wts + KV)
+#           nomic-embed-text (ollama, :11434)  — tiny; lives in ref's remaining ~20% w/ the OS
+#
+# gpu_memory_utilization is a fraction of TOTAL unified memory PER vLLM instance (not "what's left"),
+# so the two ref services must sum to <= ~0.85. Both are hybrid archs (few full-attention layers) so
+# their KV per token is small — 262k / 1M context stays viable at 0.40; it costs concurrency, not
+# headroom. Check "KV cache size: N tokens" in each service's startup log for the real numbers.
+# The two ref models share the 273 GB/s memory bus: under simultaneous load each decodes slower.
+#
+# Flash is the tight one: its ~16GB KV pool means ~1 long-context request or ~4 moderate ones. More
+# context for it means TP=2 across both nodes, which evicts the other two amigos.
+name: tres-amigos
+services:
+# ── coach: Qwen3.8-Flash-Next (125B total / 6B active MoE, GDN + Qwen Sparse Attention, 51B n-gram
+# PLE table). The checkpoint is bigger than a node's 121.6GiB, so this ONLY fits with the PLE table
+# file-backed on NVMe (host-RAM "pinned" offload frees nothing on unified memory). Config follows the
+# upstream-validated DGX Spark launch from sglang#39126 (1x GB10, TP=1, nvidia checkpoint): GSM8K
+# 97.5%, ~93 tok/s aggregate at C=8 with MTP; ~180k max input with MTP (262k without).
+#
+# Image: csv-sglang:qwen38-flash = pinned SGLang nightly (cluster.yaml) with everything upstream —
+# qwen4_exp, file-backed PLE (#39126), the sm_121 QSA decode kernel (#36845, auto-routed on GB10),
+# plus post-v0.5.20 niceties: PLE template built on the meta device (#39928 — drops a ~48GiB
+# load-time transient) and fused PLE prep for MTP verify (#40041).
+- name: flash
+  engine: sglang
+  provider: hf
+  model: nvidia/Qwen3.8-Flash-Next-NVFP4     # the checkpoint #39126 validated on Spark (fp8 PLE table)
+  served_name: qwen3.8-flash-next
+  image: csv-sglang:qwen38-flash
+  node: coach
+  port: 8000
+  max_model_len: 262144                      # -> --context-length; with MTP the KV pool caps input ~180k
+  trust_remote_code: true
+  tool_call_parser: qwen3_coder
+  reasoning_parser: qwen3
+  # MTP self-speculation via the checkpoint's own MTP layers (SGLang: NEXTN). Engine emits
+  # --speculative-algorithm NEXTN --speculative-num-draft-tokens 4; steps/topk ride in extra_args.
+  # Drop this block (and the two --speculative-* args) to trade single-stream speed for 262k input.
+  speculative:
+    method: nextn
+    num_speculative_tokens: 4
+  extra_args:
+  - --speculative-num-steps 3
+  - --speculative-eagle-topk 1
+  - --moe-runner-backend flashinfer_cutlass  # NVFP4 MoE (per #39126)
+  - --fp4-gemm-backend flashinfer_cutlass
+  - --page-size 64
+  - --chunked-prefill-size 4096
+  - --mem-fraction-static 0.85               # upstream-validated; coach runs nothing else
+  - --ple-offload-embedding
+  - --ple-offload-backend file               # PLE table as a file-backed mmap on NVMe
+  # Container-local path (docker's overlay on the node NVMe, ~50GB): a FRESH sparse file every start —
+  # upstream notes re-used populated files are rewritten on boot and much slower — and `down` removes
+  # it with the container. Needs that much free space under /var/lib/docker on coach.
+  - --ple-offload-dir /tmp/ple
+  - --enable-metrics                         # Prometheus /metrics -> gateway aggregation + Grafana
+
+# ── ref #1: Qwen3.8-27B NVFP4 — dense multimodal VLM (see qwen3.8-27b-nvfp4.yaml for the details).
+- name: qwen27b
+  engine: vllm
+  provider: hf
+  model: unsloth/Qwen3.8-27B-NVFP4
+  served_name: qwen3.8-27b-nvfp4
+  image: csv-vllm:qwen38
+  node: ref
+  port: 8000
+  max_model_len: 262144
+  gpu_memory_utilization: 0.40               # co-located w/ lightning — the pair must sum <= ~0.85
+  multimodal: true
+  limit_mm_per_prompt: {image: 4}
+  tool_call_parser: qwen3_coder
+  reasoning_parser: qwen3
+  extra_args:
+  - --generation-config auto
+  # KV cache is fp8 per the checkpoint's quantization_config — no --kv-cache-dtype needed.
+  speculative:
+    method: mtp
+    num_speculative_tokens: 3
+
+# ── ref #2: Nemotron-3.5-Lightning 30B-A3B NVFP4 (see nemotron-3.5-lightning-30b-a3b-nvfp4.yaml).
+- name: lightning
+  engine: vllm
+  provider: hf
+  model: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+  served_name: nemotron-3.5-lightning
+  image: csv-vllm:0.27.1
+  node: ref
+  port: 8001                                 # 8000 is qwen27b's on this node
+  max_model_len: 1048576                     # few attn layers + fp8 KV -> 1M still fits at 0.40
+  gpu_memory_utilization: 0.40               # co-located w/ qwen27b — the pair must sum <= ~0.85
+  trust_remote_code: true
+  tool_call_parser: qwen3_coder
+  reasoning_parser: nemotron_v3
+  extra_args:
+  - --moe-backend marlin
+  - --kv-cache-dtype fp8
+  - --mamba-backend flashinfer
+  - --mamba-cache-mode align
+  - --enable-prefix-caching
+  speculative:
+    method: dspark
+    model: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark
+    num_speculative_tokens: 4
+  env:
+    PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+- name: embeddings
+  engine: ollama
+  provider: ollama
+  node: ref
+  model: nomic-embed-text
+  port: 11434

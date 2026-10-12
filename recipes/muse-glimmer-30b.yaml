@@ -1,0 +1,35 @@
+# Meta Muse-Glimmer-30B (Meta Superintelligence Lab, Aug 2026) — dense 30B causal transformer + a
+# ~1.8B ViT-G/14 perception encoder; agentic coding + multimodal (image-text-to-text), 131k context.
+#
+# NATIVE support path (per the official vLLM recipe, recipes.vllm.ai/meta-models/Muse-Glimmer-30B):
+# needs vLLM 0.27+, which ships a native MuseGlimmerForConditionalGeneration class AND `muse_glimmer`
+# tool + reasoning parsers. We get that from the official image (pulled as csv-vllm:muse-glimmer),
+# NOT the generic --model-impl transformers backend — that produced garbage because it can't
+# replicate Muse's gated / local-global sliding-window attention. GB10 = aarch64/CUDA13 -> arm64-cu130.
+name: muse-glimmer-30b
+services:
+- name: agent
+  engine: vllm
+  provider: hf
+  model: meta-models/Muse-Glimmer-30B
+  served_name: muse-glimmer-30b
+  image: csv-vllm:muse-glimmer     # official image, native muse_glimmer (pull it: sparkctl build csv-vllm:muse-glimmer)
+  nodes: [coach, ref]              # one single-node replica per node -> gateway load-balances (no Ray)
+  port: 8000
+  max_model_len: 131072            # native context (per model card / recipe)
+  gpu_memory_utilization: 0.85     # official GB300 recipe uses 0.92; GB10 unified memory -> 0.85 safer
+  multimodal: true                 # declares vision capability to the gateway (LiteLLM supports_vision)
+  tool_call_parser: muse_glimmer   # NATIVE parsers (supersede the stopgap ATEM plugin) — return OpenAI
+  reasoning_parser: muse_glimmer   #   tool_calls + split reasoning; reasoning parser forces skip_special_tokens=False
+  limit_mm_per_prompt: {image: 4}
+  extra_args:
+  - --generation-config auto       # use the model's own sampling defaults (per the official recipe)
+  # DFlash speculative decode (~3x single-stream) — SHELVED on an upstream version skew (2026-08-10):
+  # the drafter checkpoint declares arch `MuseGlimmerAssistantModel`, but this image's `dflash` loader
+  # looks for `DFlashMuseGlimmerAssistantModel` (unsupported) -> SpeculativeConfig ValidationError.
+  # Our config matches the official recipe verbatim; both the image and the drafter repo are churning
+  # today, so re-enable once they align (re-pull the image + re-test). To turn on, uncomment:
+  # speculative:
+  #   method: dflash
+  #   model: meta-models/Muse-Glimmer-30B-assistant
+  #   num_speculative_tokens: 15

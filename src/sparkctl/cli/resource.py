@@ -14,14 +14,14 @@ from pathlib import Path
 
 import yaml
 
-from sparkctl import config, remote
+from sparkctl import config, progress, remote
 from sparkctl.backends import get_backend
 from sparkctl.distribution import ensure_models, hf_model_meta, inventory, ollama_model_meta
 from sparkctl.engines.vllm import multinode_serve_alive, svc_cname
-from sparkctl.server.lifecycle import refresh_server_if_running
+from sparkctl.server.lifecycle import refresh_or_start_server
 from sparkctl.manifest import verify_deployment, write_active_manifest
-from sparkctl.recipes import (current_recipe, load_recipe, recipe_hash, services_by_node,
-                              svc_provider, svc_world)
+from sparkctl.recipes import (SERVED_ENGINES, current_recipe, load_recipe, recipe_hash,
+                              services_by_node, svc_provider, svc_world)
 
 
 # ---------------------------------------------------------------- shared helpers
@@ -36,7 +36,7 @@ def _table(headers, rows):
 
 def _svc_placement(svc):
     """(node, port, container_name) a service actually serves from — mirrors services_by_node."""
-    if svc["engine"] == "vllm":
+    if svc["engine"] in SERVED_ENGINES:
         node = svc.get("node", config.HEAD) if svc_world(svc) <= 1 else config.HEAD
         port = svc.get("port", config.CFG["cluster"]["api_port"])
         cname = svc_cname(svc["name"], "head" if svc_world(svc) > 1 else None)
@@ -248,7 +248,7 @@ def _recipe_up(name):
     get_backend().up(load_recipe(name))
     write_active_manifest(name)
     print(f"[manifest] active.json written on all nodes (recipe {name} @ {recipe_hash(name)[:12]})")
-    refresh_server_if_running()   # if a node-hosted server is up here, repoint it at the new deploy
+    refresh_or_start_server()   # start/repoint the unified server (on its host) at the new deploy
 
 
 def resolve_apply_target(args):
@@ -270,35 +270,60 @@ _TEARDOWN_NOISE = ("weakref", "_del_library", "_clear_torch_ops", "_get_packet",
                    "jit_get_operation", "atexit")
 
 
+_EXC_RE = re.compile(r"[A-Za-z_]+(Error|Exception):")
+
+
+def _is_teardown_exc(lines, idx):
+    """Is the exception at lines[idx] interpreter-teardown noise? The giveaway usually isn't on the
+    exception line itself (e.g. `UnicodeDecodeError: invalid start byte` is markerless) but in the
+    traceback FRAMES just above it (torch's _del_library / _jit_get_operation finalizer). Scan back
+    to the enclosing 'Traceback' header (bounded) for any teardown marker."""
+    if any(n in lines[idx] for n in _TEARDOWN_NOISE):
+        return True
+    for j in range(idx - 1, max(-1, idx - 16), -1):
+        if "Traceback (most recent call last)" in lines[j]:
+            break
+        if any(n in lines[j] for n in _TEARDOWN_NOISE):
+            return True
+    return False
+
+
+def _extract_cause(lines):
+    """The real, actionable exception from a crashed engine's log tail — skipping the teardown
+    traceback that trails it. Prefer vLLM's engine-core ERROR lines, then any exception anywhere;
+    in both passes ignore teardown-noise exceptions. Pure (list[str] -> str) so it's unit-testable."""
+    def scan(idxs):
+        for i in idxs:
+            if _EXC_RE.search(lines[i]) and not _is_teardown_exc(lines, i):
+                return lines[i].split("]", 1)[-1].strip()
+        return ""
+
+    core = [i for i, l in enumerate(lines) if "core.py:1165]" in l or "EngineCore failed" in l]
+    return scan(reversed(core)) or scan(range(len(lines) - 1, -1, -1))
+
+
 def _crash_report(node, cname):
     """Exit code, OOMKilled flag, the CONCRETE cause line, and a log tail. The cause is the real
-    exception vLLM logged for the engine-core failure (via its core.py error logger) — not the
-    interpreter-teardown traceback that trails it, which otherwise buries the actual reason."""
+    exception vLLM logged for the failure — not the interpreter-teardown traceback that trails it,
+    which otherwise buries the actual reason."""
     insp = remote.on(node, f"docker inspect {cname} "
                            f"--format '{{{{.State.ExitCode}}}}|{{{{.State.OOMKilled}}}}' 2>/dev/null",
                      capture=True, check=False).stdout.strip()
     code, _, oom = insp.partition("|")
     lines = (remote.on(node, f"docker logs --tail 200 {cname} 2>&1",
                        capture=True, check=False).stdout or "").splitlines()
-    # concrete cause: last engine-core ERROR line naming an exception; skip teardown noise.
-    cause = ""
-    for ln in reversed([l for l in lines if "core.py:1165]" in l or "EngineCore failed" in l]):
-        if re.search(r"[A-Za-z_]+(Error|Exception):", ln) and not any(n in ln for n in _TEARDOWN_NOISE):
-            cause = ln.split("]", 1)[-1].strip()
-            break
-    if not cause:   # fallback: any non-teardown exception line anywhere in the tail
-        for ln in reversed(lines):
-            if re.search(r"[A-Za-z_]+(Error|Exception):", ln) and not any(n in ln for n in _TEARDOWN_NOISE):
-                cause = ln.split("]", 1)[-1].strip()
-                break
-    return (code or "?"), (oom.strip().lower() == "true"), cause, "\n".join(lines[-15:]).rstrip()
+    return (code or "?"), (oom.strip().lower() == "true"), _extract_cause(lines), \
+        "\n".join(lines[-15:]).rstrip()
 
 
-def _fail_service(svc, node, cname, why):
+def _fail_service(svc, node, cname, why, context=()):
     """Print an actionable crash report for one service, then exit non-zero. Called from the wait
-    loop the moment a container is found dead — the deployment is not serving, say so loudly."""
+    loop the moment a container is found dead — the deployment is not serving, say so loudly.
+    `context` lines (memguard kills, last free-memory readings) print right under the headline."""
     code, oom, cause, tail = _crash_report(node, cname)
     print(f"[wait] ❌ {svc['name']} on {node} {why} (exit={code}, OOMKilled={oom})", flush=True)
+    for line in context:
+        print(f"[wait]    {line}", flush=True)
     if cause:
         print(f"[wait]    cause: {cause}", flush=True)
     if oom:
@@ -312,10 +337,81 @@ def _fail_service(svc, node, cname, why):
     sys.exit(f"[wait] deployment FAILED — '{svc['name']}' is not serving (full log: sparkctl logs {svc['name']})")
 
 
+MEM_WARN_GIB = 15          # warn when free memory is under this AND falling fast...
+MEM_WARN_RATE = -5         # ...faster than this many GiB/min,
+MEM_CRIT_GIB = 8           # or unconditionally under this (memguard kills below its floor, 6 GiB)
+
+
+class _LoadWatch:
+    """Per-apply telemetry state for the wait loop: memory history per node, memguard kills seen,
+    one-time engine facts already printed. See sparkctl.progress for the parsing."""
+
+    def __init__(self, recipe, t0):
+        self.t0 = t0
+        self.served = [s for s in recipe["services"] if s["engine"] in SERVED_ENGINES]
+        nodes = set()
+        for s in self.served:
+            nodes |= {config.HEAD, config.WORKER} if svc_world(s) > 1 else {_svc_placement(s)[0]}
+        self.nodes = sorted(n for n in nodes if n)
+        self.mem = {n: [] for n in self.nodes}            # node -> [(t, gib), ...]
+        self.kills, self.facts, self.last_warn = set(), {}, {}
+
+    def sample_memory(self):
+        """Every poll: record free memory, warn on a fast fall, surface memguard kills at once."""
+        now = time.time()
+        for node in self.nodes:
+            gib, kills = progress.probe_node(node, self.t0)
+            for k in kills:
+                if (node, k) not in self.kills:
+                    self.kills.add((node, k))
+                    print(f"[wait] 🛑 {node} memguard: {k}", flush=True)
+            if gib is None:
+                continue
+            hist = self.mem[node]
+            hist.append((now, gib))
+            del hist[:-60]
+            rate = progress.mem_trend(hist, gib)
+            falling = rate is not None and rate < MEM_WARN_RATE
+            if (gib < MEM_CRIT_GIB or (gib < MEM_WARN_GIB and falling)) \
+                    and now - self.last_warn.get(node, 0) >= 30:
+                self.last_warn[node] = now
+                trend = f", falling {-rate:.0f} GiB/min" if falling else ""
+                print(f"[wait] ⚠️  {node}: {gib:.1f} GiB free{trend} — unified memory is nearly "
+                      f"exhausted (memguard kills serve containers below 6 GiB)", flush=True)
+
+    def heartbeat(self, elapsed, pending_names):
+        """Every 30s: each still-loading service's phase + new one-time facts, and free memory."""
+        mem = ", ".join(f"{n} {h[-1][1]:.0f} GiB free" for n, h in self.mem.items() if h)
+        phases = []
+        for svc in self.served:
+            if svc.get("served_name") not in pending_names:
+                continue
+            node, _, cname = _svc_placement(svc)
+            phase, facts = progress.parse_engine_log(progress.engine_log(node, cname))
+            for key, msg in facts.items():
+                if (svc["name"], key) not in self.facts:
+                    self.facts[(svc["name"], key)] = msg
+                    print(f"[wait] {svc['name']}: {msg}", flush=True)
+            phases.append(f"{svc['name']}: {phase or 'starting'}")
+        detail = " · ".join(p for p in (", ".join(phases), mem) if p)
+        print(f"[wait] {elapsed:.0f}s — {detail or ', '.join(sorted(pending_names))}", flush=True)
+
+    def context(self, node):
+        """Crash-report lines: memguard kills on that node and its recent free-memory readings."""
+        lines = [f"memguard on {n} killed it: {k}" for n, k in sorted(self.kills) if n == node]
+        hist = self.mem.get(node) or []
+        if hist:
+            lines.append(f"{node} free memory, last readings: "
+                         + " → ".join(f"{g:.0f}" for _, g in hist[-6:]) + " GiB")
+        return lines
+
+
 def _wait_ready(recipe, timeout):
     """Block until every endpoint of the deployment answers /v1/models — vLLM finishes loading
-    weights well after its container reports 'Up'. Polls every 5s with a 30s heartbeat, fails
-    FAST (with a crash report) if a service's container dies, exits non-zero on timeout."""
+    weights well after its container reports 'Up'. Polls every 5s with a 30s heartbeat that shows
+    each service's load phase, key facts (weights/rank, KV capacity) and per-node free memory;
+    warns when unified memory is running out, fails FAST (with a crash report) if a service's
+    container dies, exits non-zero on timeout."""
     backend = get_backend()
     served_from = config.SELF or config.SERVER.get("host", "local")
     pending = {(served, base)
@@ -324,6 +420,7 @@ def _wait_ready(recipe, timeout):
     print(f"[wait] waiting on {len(pending)} endpoint(s), timeout {timeout}s "
           f"(big models take minutes to load)", flush=True)
     t0, last_note = time.time(), 0.0
+    watch = _LoadWatch(recipe, t0)
     while pending:
         for tgt in sorted(pending):
             served, base = tgt
@@ -337,30 +434,35 @@ def _wait_ready(recipe, timeout):
         if elapsed > timeout:
             sys.exit("[wait] TIMEOUT — still not answering: "
                      + ", ".join(base for _, base in sorted(pending)))
+        watch.sample_memory()
         status = backend.status()   # docker ps lists running only — a vanished container crashed
         for svc in recipe["services"]:
             node, _, cname = _svc_placement(svc)
             if not status.get(node, {}).get(cname):
-                _fail_service(svc, node, cname, "exited during load")
+                _fail_service(svc, node, cname, "exited during load", watch.context(node))
             if svc["engine"] == "vllm" and svc_world(svc) > 1 \
                     and not multinode_serve_alive(cname):
-                _fail_service(svc, node, cname, "crashed inside its Ray container")
+                where = ("its Ray container" if svc.get("distributed_backend", "ray") == "ray"
+                         else "its container")
+                _fail_service(svc, node, cname, f"serve process died inside {where}",
+                              watch.context(node))
         if elapsed - last_note >= 30:
             last_note = elapsed
-            print(f"[wait] still loading ({elapsed:.0f}s): "
-                  + ", ".join(sorted({s for s, _ in pending})), flush=True)
+            watch.heartbeat(elapsed, {s for s, _ in pending})
         time.sleep(5)
     print(f"[wait] deployment ready in {time.time() - t0:.0f}s ✅")
 
 
 def _ensure_images(recipe):
-    """Fail early — before tearing down the running deployment — if a service pins an `image:` that
-    isn't built on a node it will run on. Presence-only: variant images are built explicitly with
-    `sparkctl build <image>`; we never auto-pull/build mid-apply (a silent pull of the wrong thing is
-    worse than a clear stop). The cluster default image is a build/deploy invariant, so skip it."""
-    missing = []
+    """Before tearing down the running deployment, make sure every pinned (non-default) `image:` is
+    present on the nodes that will run it — building or pulling it if not, per its cluster.images
+    declaration. We only ever provision DECLARED images (a known dockerfile:/pull: spec), so this is
+    materializing exactly what the operator wrote in cluster.yaml, not guessing; an UNDECLARED pinned
+    image is still a hard stop. The cluster default image is a build/deploy invariant → skip it."""
+    from sparkctl.cli.main import _image_targets
+    specs = {tag: (df, pull) for tag, df, pull in _image_targets()}
     for svc in recipe["services"]:
-        if svc["engine"] != "vllm":
+        if svc["engine"] not in SERVED_ENGINES:   # ollama uses its own fixed image, nothing to provision
             continue
         img = svc.get("image", config.IMAGE)
         if img == config.IMAGE:
@@ -368,13 +470,18 @@ def _ensure_images(recipe):
         nodes = [config.HEAD, config.WORKER] if svc_world(svc) > 1 else [svc.get("node", config.HEAD)]
         for node in [n for n in nodes if n]:
             if remote.on(node, f"docker image inspect {img} >/dev/null 2>&1",
-                         check=False, capture=True).returncode != 0:
-                missing.append((node, img))
-    if missing:
-        for node, img in missing:
-            print(f"[apply] ❌ pinned image '{img}' not found on {node}", flush=True)
-        tag = sorted({img for _, img in missing})[0]
-        sys.exit(f"[apply] build it first: sparkctl build {tag}")
+                         check=False, capture=True).returncode == 0:
+                continue
+            if img not in specs:
+                sys.exit(f"[apply] pinned image '{img}' is missing on {node} and not declared under "
+                         f"cluster.images — declare it (dockerfile:/pull:) or build it, then re-apply.")
+            df, pull = specs[img]
+            if pull:
+                print(f"[apply] image '{img}' missing on {node} — pulling {pull}", flush=True)
+                remote.on(node, f"docker pull {pull} && docker tag {pull} {img}")
+            else:
+                print(f"[apply] image '{img}' missing on {node} — building ({df})", flush=True)
+                remote.on(node, f"docker build -t {img} -f {config.REMOTE}/docker/{df} {config.REMOTE}/docker")
 
 
 def cmd_apply(args):

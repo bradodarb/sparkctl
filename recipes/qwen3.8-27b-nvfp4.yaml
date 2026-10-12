@@ -1,0 +1,46 @@
+# Qwen3.8-27B NVFP4 (unsloth quant of Qwen/Qwen3.8-27B) — same dense 27B multimodal VLM
+# (Qwen3_5ForConditionalGeneration / qwen3_5), compressed-tensors NVFP4: 4-bit MLP projections
+# (group 16), fp8 on the last 8 layers + lm_head, and fp8 KV cache baked into the checkpoint; the
+# vision tower stays unquantized. ~15GB weights (vs ~54GB bf16) -> far more KV headroom, so we run
+# the FULL 262k native context here. Reuses the purpose-built qwen3_5 image (native arch +
+# compressed-tensors NVFP4 backend) — same csv-vllm:qwen38 as the bf16 recipe, no new image.
+name: qwen3.8-27b-nvfp4
+services:
+- name: agent
+  engine: vllm
+  provider: hf
+  model: unsloth/Qwen3.8-27B-NVFP4
+  served_name: qwen3.8-27b-nvfp4
+  image: csv-vllm:qwen38            # purpose-built vLLM image w/ native qwen3_5 arch + vision + NVFP4
+  nodes: [coach, ref]              # one single-node (TP=1) replica per node -> gateway load-balances
+  port: 8000
+  max_model_len: 262144            # full native context — NVFP4 (~15GB) + fp8 KV leaves ample room
+  gpu_memory_utilization: 0.85     # unified memory shared w/ OS; plenty of headroom at this quant
+  multimodal: true                 # declares vision to the gateway (LiteLLM supports_vision)
+  limit_mm_per_prompt: {image: 4}  # up to 4 images/request; add `video: 1` for video (Qwen-VL supports it)
+  tool_call_parser: qwen3_coder         # Qwen3 function-calling format in vLLM
+  reasoning_parser: qwen3          # splits the <think>…</think> channel into reasoning_content
+  extra_args:
+  - --generation-config auto       # model's own sampling defaults (thinking: temp 1.0/top_p 0.95/top_k 20)
+  # KV cache is fp8 per the checkpoint's quantization_config — no --kv-cache-dtype needed.
+  # ── MTP self-speculative decode. The checkpoint ships its own MTP head (text_config
+  # mtp_num_hidden_layers: 1), so vLLM drafts + verifies extra token(s) per forward pass using the
+  # TARGET's own weights — no separate drafter to download, and correctness is preserved (the target
+  # verifies every proposed token). Biggest single-stream / low-concurrency token-gen win on GB10,
+  # where decode is memory-bandwidth-bound (~273 GB/s) so more tokens per weight-read is ~free.
+  # num_speculative_tokens: 1 matches the single MTP head (highest accept rate, safest). Newer vLLM can
+  # reuse the head autoregressively for 2-3 — often still a net win here, but accept rate drops per
+  # extra token; A/B with bin/loadgen.py and keep whichever wins aggregate tok/s. Under heavy
+  # concurrency spec can hurt (wasted compute on rejects); with 2 replicas + a few convos each we stay
+  # in the win zone. sparkctl emits this as single-quoted --speculative-config JSON (shell-safe).
+  speculative:
+    method: mtp                    # self-speculation via the model's MTP head (no drafter model to fetch)
+    num_speculative_tokens: 3      # = mtp_num_hidden_layers; bump to 2 and watch the accept rate
+  # 1M context: max_model_len: 1000000 + env VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1" + a YaRN --hf-overrides
+  # rope_parameters override (rope_type: yarn, factor: 4.0, original_max_position_embeddings: 262144).
+- name: embeddings
+  engine: ollama
+  provider: ollama
+  node: ref
+  model: nomic-embed-text
+  port: 11434

@@ -1,0 +1,81 @@
+# Qwen3.8-Flash-Next NVFP4 — ONE instance, TP=2 + expert parallel across both GB10 nodes (vLLM mp
+# backend: rank 0 + API server on coach, headless rank 1 on ref). Tuned for 4-8 concurrent long
+# sessions at the full 262k native context.
+#
+# Why TP=2 over one-replica-per-node (SGLang, tres-amigos' `flash`): each node holds ~64GiB of
+# weights instead of ~81GiB, and the 2 KV heads split one per rank, so per-node KV per token halves —
+# ~5-7x the long-session capacity of two replicas, and no cross-replica prefix-cache misses (one
+# radix tree, so a multi-turn session can't land on the node that lacks its cache).
+#
+# Expected (published dual-Spark NVFP4 runs, not yet measured here): ~54 tok/s single stream (MTP3,
+# prose; code higher), ~207 tok/s aggregate at C=8 (~27/stream), ~3k tok/s prefill (a cold 256k
+# prompt is ~90s TTFT; warm turns only prefill the new tokens). bf16 KV at 0.835 reported ~1.34M
+# tokens (~5 full-262k sessions); check "GPU KV cache size: N tokens" in the head's startup log.
+#
+# csv-vllm:0.31.0 = stock v0.31.0 + fastsafetensors (docker/Dockerfile.v031; qwen4_exp native, GB10 hybrid prefix-caching fixes #53906/#48375, fp8 QSA KV
+# #55557). The blazux single-Spark recipe carries patches on top of v0.31 (non-deterministic GB10
+# QSA top-k kernel, a mamba-state prefix-cache fix, tool-call markers) — if we hit nondeterminism or
+# corrupted resumed turns, those patches are the first suspect and go in a csv-vllm Dockerfile.
+name: qwen3.8-flash-next-tp2
+services:
+- name: flash
+  engine: vllm
+  provider: hf
+  model: nvidia/Qwen3.8-Flash-Next-NVFP4       # routed experts W4A4; attention/shared experts bf16 —
+  served_name: qwen3.8-flash-next              #   within noise of the FP8 baseline per NVIDIA's card
+  image: csv-vllm:0.31.0
+  parallel:
+    tensor: 2
+  distributed_backend: mp                      # no-Ray: --nnodes/--node-rank over the CX7 fabric
+  port: 8000
+  max_model_len: 262144                        # full native context (1M needs YaRN --hf-overrides)
+  gpu_memory_utilization: 0.80                 # first bring-up margin after the 10-11 coach OOM hangs; the
+                                               #   dual-Spark reference runs 0.835 — raise once load is proven
+  tool_call_parser: qwen3_xml                  # reported as the only working parser for this model in
+                                               #   vLLM (qwen3_coder misparses) — verify with one tool call
+  reasoning_parser: qwen3
+  # MTP self-speculation via the checkpoint's own MTP head (fp8 routed experts). ~65% accept at 3.
+  speculative:
+    method: mtp
+    num_speculative_tokens: 3
+  extra_args:
+  # The 51GB n-gram (PLE / "Engram") table: vLLM defaults cpu_offload=True -> pinned host RAM for UVA
+  # lookup. On GB10 unified memory that frees nothing — it's unswappable memory ON TOP of the
+  # gpu_memory_utilization reservation, invisible to vLLM's KV profiling. It hard-hung coach mid-load
+  # (2026-10-11: no SSH, rank 1 died on a 600s NCCL broadcast timeout). false -> TP-sharded on the
+  # GPU (~25GB/rank), accounted for in the KV budget — the MiaAI dual-Spark layout.
+  - "--engram-config='{\"cpu_offload\":false}'"
+  - --enable-expert-parallel                   # NVFP4 routed experts sharded across ranks
+  - --max-num-seqs 8                           # session cap: keeps per-stream decode >= ~27 tok/s
+  # Prefix caching for the hybrid (GDN + QSA) stack: align mode is required (GDN can't do `all`).
+  # Hits land on mamba-block multiples (~1.6k tokens bf16), so each turn re-prefills at most a block.
+  - --enable-prefix-caching
+  - --mamba-cache-mode align
+  # GDN recurrent state in bf16: halves the ~108MB/session re-read every decode step (bandwidth-bound
+  # on GB10). Small precision trade — the H200 cookbook keeps float32; drop this line to match it.
+  - --mamba-ssm-cache-dtype bfloat16
+  # Smaller prefill chunks: a fresh 256k prompt interleaves with the other streams' decode instead
+  # of stalling them. Raise (16384) for faster cold prefill if TTFT matters more than smoothness.
+  - --max-num-batched-tokens 8192
+  # ── KV dtype: main KV stays bf16 (vLLM default) — fastest decode/prefill; fp8 costs ~4% decode and
+  # 3-17% prefill. Switch if the startup KV count is under ~8 x 262k for your real session lengths:
+  # - --kv-cache-dtype fp8                     # ~1.7x KV capacity (~3.65M tokens reported)
+  # A/B separately — speeds prefill index scoring upstream, unproven for decode on GB10:
+  # - --attention-config.indexer_kv_dtype fp8
+  # NO fastsafetensors here, despite the usual multinode rule (validate will warn): under TP>1 it
+  # round-robins whole FILES to ranks and stages each file fully in GPU memory before sharding.
+  # Sorted, the 11th file — model-fp8-mtp-ple.safetensors, 53.7GB — lands on rank 0 (coach logs
+  # "0/6" shards), so coach alone needs a ~54GB transient on top of loaded weights -> NVRM OOM ->
+  # hard hang (2026-10-11, three times; memguard's 1s poll can't catch one giant allocation).
+  # The default loader streams tensor-by-tensor: slower on Spark, no giant transient.
+  # - --load-format=fastsafetensors
+  # If MoE backend auto-select crashes on sm_121 (cf. deepseek-v4-flash marlin SEGV), pin it:
+  # - --moe-backend=flashinfer_cutlass
+  # Fabric NCCL env + VLLM_HOST_IP are injected per rank by the engine.
+
+- name: embeddings
+  engine: ollama
+  provider: ollama
+  node: ref                                    # headless rank lives here; API server is on coach
+  model: nomic-embed-text
+  port: 11434

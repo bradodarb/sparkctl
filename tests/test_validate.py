@@ -303,3 +303,129 @@ def test_unfixable_findings_have_no_fix():
         "extra_args": ["--load-format=safetensors", "--safetensors-load-strategy=eager"]}]}
     gpu = [f for f in lint_recipe(recipe) if "gpu_memory_utilization" in f.message]
     assert gpu and gpu[0].fix is None
+
+
+# ---------------------------------------------------------------- nodes: fan-out lint rules
+def _nodes_svc(**over):
+    svc = {"name": "agent", "engine": "vllm", "model": "org/M", "served_name": "coder",
+           "nodes": ["coach", "ref"], "port": 8000}
+    svc.update(over)
+    return {"name": "r", "services": [svc]}
+
+
+def test_nodes_and_node_together_is_error():
+    findings = lint_recipe(_nodes_svc(node="coach"))
+    assert any(f.level == "error" and "not both" in f.message for f in findings)
+
+
+def test_nodes_with_multinode_parallel_is_error():
+    findings = lint_recipe(_nodes_svc(parallel={"tensor": 2}))
+    assert any(f.level == "error" and "already spans nodes" in f.message for f in findings)
+
+
+def test_nodes_unknown_node_is_error():
+    findings = lint_recipe(_nodes_svc(nodes=["coach", "bogus"]), known_nodes={"coach", "ref"})
+    assert any(f.level == "error" and "bogus" in f.message for f in findings)
+
+
+def test_nodes_empty_list_is_error():
+    findings = lint_recipe(_nodes_svc(nodes=[]))
+    assert any(f.level == "error" and "non-empty list" in f.message for f in findings)
+
+
+def test_nodes_duplicate_warns_and_fixes():
+    recipe = _nodes_svc(nodes=["coach", "ref", "coach"])
+    assert _apply_all_fixes(recipe, known_nodes={"coach", "ref"}) == []
+    assert recipe["services"][0]["nodes"] == ["coach", "ref"]
+
+
+def test_plain_nodes_recipe_is_clean():
+    assert lint_recipe(_nodes_svc(), known_nodes={"coach", "ref"}) == []
+
+
+# ---------------------------------------------------------------- multimodal / VLM lints
+def _vlm_svc(**over):
+    svc = {"name": "vlm", "engine": "vllm", "model": "org/VLM", "served_name": "vlm",
+           "node": "coach", "port": 8000, "multimodal": True, "model_impl": "transformers",
+           "limit_mm_per_prompt": {"image": 4}}
+    svc.update(over)
+    return {"name": "r", "services": [svc]}
+
+
+def test_model_impl_invalid_is_error():
+    assert any(f.level == "error" and "model_impl" in f.message
+               for f in lint_recipe(_vlm_svc(model_impl="wrong")))
+
+
+def test_limit_mm_must_be_mapping():
+    assert any(f.level == "error" and "limit_mm_per_prompt" in f.message
+               for f in lint_recipe(_vlm_svc(limit_mm_per_prompt=[4])))
+
+
+def test_multimodal_must_be_bool():
+    assert any(f.level == "error" and "multimodal" in f.message
+               for f in lint_recipe(_vlm_svc(multimodal="yes")))
+
+
+def test_multimodal_without_limit_is_info():
+    fs = lint_recipe(_vlm_svc(limit_mm_per_prompt=None))
+    assert any(f.level == "info" and "limit_mm_per_prompt" in f.message for f in fs)
+
+
+def test_clean_vlm_recipe_passes():
+    assert lint_recipe(_vlm_svc(), known_nodes={"coach", "ref"}) == []
+
+
+def test_tool_parser_plugin_without_parser_warns():
+    recipe = {"name": "r", "services": [{
+        "name": "vlm", "engine": "vllm", "model": "m", "node": "coach", "port": 8000,
+        "tool_parser_plugin": "/opt/p/atem.py"}]}   # no tool_call_parser
+    assert any(f.level == "warn" and "tool_parser_plugin" in f.message for f in lint_recipe(recipe))
+
+
+def test_speculative_needs_method_and_model():
+    from sparkctl.cli.validate import lint_recipe as L
+    base = {"name": "vlm", "engine": "vllm", "model": "m", "node": "coach", "port": 8000}
+    assert any(f.level == "error" and "method" in f.message
+               for f in L({"name": "r", "services": [dict(base, speculative={"num_speculative_tokens": 2})]}))
+    assert any(f.level == "error" and "drafter 'model'" in f.message
+               for f in L({"name": "r", "services": [dict(base, speculative={"method": "dflash"})]}))
+    # ngram self-speculates -> no model required -> clean
+    assert L({"name": "r", "services": [dict(base, speculative={"method": "ngram"})]},
+             known_nodes={"coach"}) == []
+
+
+# ---------------------------------------------------------------- sglang engine
+def _sglang_svc(**over):
+    svc = {"name": "agent", "engine": "sglang", "model": "org/M", "served_name": "muse",
+           "node": "coach", "port": 8000, "max_model_len": 131072,
+           "tool_call_parser": "muse", "reasoning_parser": "muse", "trust_remote_code": True,
+           "speculative": {"method": "dflash", "model": "org/drafter", "draft_quantization": "fp8"},
+           "extra_args": ["--mem-fraction-static 0.38", "--no-enable-multimodal"]}
+    svc.update(over)
+    return {"name": "r", "services": [svc]}
+
+
+def test_sglang_engine_accepted_clean():
+    assert lint_recipe(_sglang_svc(), known_nodes={"coach", "ref"}) == []
+
+
+def test_sglang_rejects_multinode_parallel():
+    fs = lint_recipe(_sglang_svc(parallel={"tensor": 2}), known_nodes={"coach"})
+    assert any(f.level == "error" and "single-node" in f.message for f in fs)
+
+
+def test_sglang_speculative_dflash_needs_model():
+    fs = lint_recipe(_sglang_svc(speculative={"method": "dflash"}), known_nodes={"coach"})
+    assert any(f.level == "error" and "drafter 'model'" in f.message for f in fs)
+
+
+def test_sglang_warns_on_vllm_only_knob():
+    fs = lint_recipe(_sglang_svc(gpu_memory_utilization=0.85), known_nodes={"coach"})
+    assert any(f.level == "warn" and "vllm-only" in f.message for f in fs)
+
+
+def test_dspark_method_needs_model():
+    base = {"name": "svc", "engine": "vllm", "model": "m", "node": "coach", "port": 8000}
+    assert any(f.level == "error" and "drafter 'model'" in f.message
+               for f in lint_recipe({"name": "r", "services": [dict(base, speculative={"method": "dspark"})]}))

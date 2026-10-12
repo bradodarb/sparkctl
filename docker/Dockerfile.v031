@@ -1,0 +1,15 @@
+# Variant image: stock vLLM 0.31.0 (native qwen4_exp / Qwen3.8-Flash-Next, GB10 hybrid prefix-cache
+# fixes, fp8 QSA KV) + fastsafetensors for multinode loads (Spark mmap is pathologically slow, and the
+# default loader can hit the GDS/cuFile path under TP>1). The NGC images ship fastsafetensors; the
+# upstream one may not, so install it only if missing. Multi-arch base -> aarch64 on GB10. No Ray:
+# recipes on this image use distributed_backend: mp. Build: `sparkctl build csv-vllm:0.31.0`.
+# GB10 patches (e.g. blazux's QSA top-k determinism fix) would land here if they prove necessary.
+# procps: `apply`'s readiness wait probes a multinode head with `docker exec ... pgrep -f 'vllm serve'`
+# (engines/vllm.py:multinode_serve_alive); without pgrep that probe fails and reads as a crash.
+ARG BASE=vllm/vllm-openai:v0.31.0
+FROM ${BASE}
+RUN command -v pgrep >/dev/null \
+    || (apt-get update && apt-get install -y --no-install-recommends procps && rm -rf /var/lib/apt/lists/*)
+RUN python3 -c "import fastsafetensors" 2>/dev/null \
+    || pip install --no-cache-dir fastsafetensors \
+    && python3 -c "import fastsafetensors"

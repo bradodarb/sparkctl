@@ -1,0 +1,10 @@
+# Variant image: NGC vLLM 26.07 (vLLM 0.24.0, CUDA 13, sm_121) + Ray for multi-node serving.
+# Same recipe as the default docker/Dockerfile, one release newer — 26.07 adds parsers/models that
+# 0.22.1 lacks (e.g. minimax_m3 tool + reasoning parsers, verified present). NVIDIA still ships no Ray
+# in this image, and vLLM's `--distributed-executor-backend ray` needs it for cross-node TP/PP, so we
+# add the same pinned Ray. Pin a recipe service to this with `image: csv-vllm:26.07-ray`; build it on
+# the nodes with `sparkctl build csv-vllm:26.07-ray` (declared under cluster.images in cluster.yaml).
+ARG BASE=nvcr.io/nvidia/vllm:26.07-py3
+FROM ${BASE}
+RUN pip install --no-cache-dir "ray[default]==2.54.0" \
+    && ray --version

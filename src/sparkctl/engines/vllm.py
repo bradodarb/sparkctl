@@ -28,6 +28,29 @@ def svc_cname(name, role=None):
     return f"{config.PFX}-svc-{name}" + (f"-{role}" if role else "")
 
 
+def _engine_extra_flags(svc):
+    """Engine-level flags that shape the VllmConfig and so must match on EVERY rank (the API head
+    AND every headless mp worker): trust-remote-code, model implementation, multimodal limits, then
+    the free-form extra_args passthrough. Kept separate from the API-server-only flags
+    (served-name/host/port/tool+reasoning parsers) so head and worker stay in lockstep."""
+    flags = []
+    if svc.get("trust_remote_code"):
+        flags.append("--trust-remote-code")
+    if svc.get("model_impl"):                                  # auto | vllm | transformers
+        flags.append(f"--model-impl {svc['model_impl']}")
+    for field, cli in (("limit_mm_per_prompt", "--limit-mm-per-prompt"),
+                       ("mm_processor_kwargs", "--mm-processor-kwargs"),
+                       ("speculative", "--speculative-config")):
+        val = svc.get(field)
+        if val is not None:
+            # JSON must survive ssh -> docker -> bash -lc: wrap in single quotes so bash passes it as
+            # one literal arg instead of stripping quotes and brace-expanding {a,b}. We hold these as
+            # dicts in YAML, so no hand-escaping in the recipe.
+            flags.append(f"{cli}='{json.dumps(val, separators=(',', ':'))}'")
+    flags += svc.get("extra_args", [])
+    return flags
+
+
 def _vllm_serve_flags(svc):
     tp = svc.get("parallel", {}).get("tensor", 1)
     pp = svc.get("parallel", {}).get("pipeline", 1)
@@ -36,31 +59,40 @@ def _vllm_serve_flags(svc):
              f"--max-model-len {svc['max_model_len']}",
              f"--gpu-memory-utilization {svc['gpu_memory_utilization']}",
              f"--tensor-parallel-size {tp}", f"--pipeline-parallel-size {pp}"]
+    if svc.get("tool_parser_plugin"):        # load a custom out-of-tree ToolParser (before selecting it)
+        flags += [f"--tool-parser-plugin {svc['tool_parser_plugin']}"]
     if svc.get("tool_call_parser"):
         flags += ["--enable-auto-tool-choice", f"--tool-call-parser {svc['tool_call_parser']}"]
     if svc.get("reasoning_parser"):
         flags += [f"--reasoning-parser {svc['reasoning_parser']}"]
-    flags += svc.get("extra_args", [])
-    return " ".join(flags)
+    return " ".join(flags + _engine_extra_flags(svc))
 
 
 def _worker_engine_flags(svc):
     """Engine-side flags a headless mp worker needs — they must produce the SAME VllmConfig as the
-    head (model/parallel/memory/quant all have to match across ranks). The API-server flags
-    (served-name/host/port/tool+reasoning parsers) are head-only and unused under --headless."""
+    head (model/parallel/memory/quant/multimodal all have to match across ranks). The API-server
+    flags (served-name/host/port/tool+reasoning parsers) are head-only and unused under --headless."""
     tp = svc.get("parallel", {}).get("tensor", 1)
     pp = svc.get("parallel", {}).get("pipeline", 1)
     flags = [f"--max-model-len {svc['max_model_len']}",
              f"--gpu-memory-utilization {svc['gpu_memory_utilization']}",
              f"--tensor-parallel-size {tp}", f"--pipeline-parallel-size {pp}"]
-    return " ".join(flags + svc.get("extra_args", []))
+    return " ".join(flags + _engine_extra_flags(svc))
 
 
 def _docker_common():
     # secrets (sparkctl secret set ...) flow in via --env-file so vLLM authenticates to the HF Hub
     # (gated tokenizers/config fetched at serve time); $() expands on the node. Mirrors ollama.py.
+    # --entrypoint bash: our launch commands are `-lc <cmd>`, so force a shell entrypoint regardless
+    # of the base image's own ENTRYPOINT — official images (vllm/vllm-openai) set ENTRYPOINT ["vllm"],
+    # which would otherwise swallow our command as `vllm bash -lc ...` -> "unrecognized arguments".
+    # RDMA: --network host exposes the RoCE netdevs but NOT the verbs devices; without
+    # /dev/infiniband NCCL can't open IB and SILENTLY falls back to TCP sockets (found 2026-10-11:
+    # RoCE port_xmit_data stayed 0 while TP=2 decode ran ~2x slow over eth). Passed only when the
+    # node has it ($() expands on the node, like the secrets file); IPC_LOCK lets verbs pin memory.
     return (f"--network host --gpus all --ipc host --ulimit memlock=-1 "
-            f"--ulimit stack=67108864 -d "
+            f"--ulimit stack=67108864 -d --entrypoint bash "
+            f'$(test -d /dev/infiniband && echo --device=/dev/infiniband --cap-add=IPC_LOCK) '
             f'$(test -f "$HOME/.sparkctl/secrets.env" && echo --env-file "$HOME/.sparkctl/secrets.env") '
             f"-v {config.CACHE}:/root/.cache/huggingface")
 
@@ -78,7 +110,7 @@ def vllm_up(svc):
         serve = f"vllm serve {model} {serve_flags}"
         print(f"[vllm] single-node serve '{svc['name']}' on {node} (image {img})")
         remote.on(node, f"docker run {_docker_common()} --name {svc_cname(svc['name'])} "
-                        f"{env_flags(base_env)} {img} bash -lc {json.dumps(serve)}")
+                        f"{env_flags(base_env)} {img} -lc {json.dumps(serve)}")
         print(f"[vllm] launched; watch: sparkctl logs {svc['name']}")
         return
 
@@ -102,9 +134,9 @@ def _ray_multinode_up(svc, model, img, serve_flags, tp, pp, world, fenv, head_ip
     hn, wn = svc_cname(svc['name'], 'head'), svc_cname(svc['name'], 'worker')
     print(f"[vllm] Ray containers for '{svc['name']}' (image {img}, TP={tp} PP={pp}, world={world})")
     remote.on(config.HEAD, f"docker run {_docker_common()} --rm --name {hn} "
-                           f"{env_flags({**fenv, 'VLLM_HOST_IP': head_ip})} {img} sleep infinity")
+                           f"{env_flags({**fenv, 'VLLM_HOST_IP': head_ip})} {img} -lc {json.dumps('sleep infinity')}")
     remote.on(config.WORKER, f"docker run {_docker_common()} --rm --name {wn} "
-                             f"{env_flags({**fenv, 'VLLM_HOST_IP': worker_ip})} {img} sleep infinity")
+                             f"{env_flags({**fenv, 'VLLM_HOST_IP': worker_ip})} {img} -lc {json.dumps('sleep infinity')}")
     obj = "--object-store-memory=1073741824"          # Spark OOM fix: shrink Ray plasma store
     ray_head = (f"ray start --head --node-ip-address={head_ip} --port=6379 "
                 f"--num-gpus=1 --dashboard-host=0.0.0.0 {obj}")
@@ -140,12 +172,12 @@ def _mp_multinode_up(svc, model, img, serve_flags, tp, pp, world, fenv, head_ip,
     remote.on(config.HEAD,
               f"docker rm -f {hn} >/dev/null 2>&1 || true; "
               f"docker run {_docker_common()} --name {hn} "
-              f"{env_flags({**fenv, 'VLLM_HOST_IP': head_ip})} {img} bash -lc {json.dumps(head_serve)}")
+              f"{env_flags({**fenv, 'VLLM_HOST_IP': head_ip})} {img} -lc {json.dumps(head_serve)}")
     time.sleep(3)
     remote.on(config.WORKER,
               f"docker rm -f {wn} >/dev/null 2>&1 || true; "
               f"docker run {_docker_common()} --name {wn} "
-              f"{env_flags({**fenv, 'VLLM_HOST_IP': worker_ip})} {img} bash -lc {json.dumps(worker_serve)}")
+              f"{env_flags({**fenv, 'VLLM_HOST_IP': worker_ip})} {img} -lc {json.dumps(worker_serve)}")
     print(f"[vllm] launched; watch: sparkctl logs {svc['name']}")
 
 

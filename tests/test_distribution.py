@@ -13,17 +13,20 @@ RECIPE = {"services": [
 class FakeRemote:
     """Record every on() call; answer presence probes from configurable sets."""
 
-    def __init__(self, present_nodes=(), on_nas=False, ollama_nodes=()):
+    def __init__(self, present_nodes=(), on_nas=False, ollama_nodes=(), manifests=None):
         self.present_nodes = set(present_nodes)
         self.on_nas = on_nas
         self.ollama_nodes = set(ollama_nodes)
+        self.manifests = manifests or {}               # node -> snapshot listing (default: all equal)
         self.calls = []
 
     def __call__(self, node, cmd, **kw):
         self.calls.append((node, cmd))
         rc, stdout = 0, ""
         nas_target = "ssh -o BatchMode" in cmd or "/mnt/nas" in cmd or "/export/" in cmd
-        if "models--*" in cmd:                          # HF inventory listing (node cache or NAS)
+        if "find -L" in cmd:                            # snapshot manifest (names + sizes)
+            stdout = self.manifests.get(node, "rev/a.safetensors 10\n")
+        elif "models--*" in cmd:                        # HF inventory listing (node cache or NAS)
             if self.on_nas if nas_target else node in self.present_nodes:
                 stdout = "models--org--M\n"
         elif "manifests" in cmd:                        # ollama store listing
@@ -43,8 +46,8 @@ class FakeRemote:
 
 @pytest.fixture
 def fake(monkeypatch):
-    def make(present_nodes=(), on_nas=False, nas=None, ollama_nodes=()):
-        fr = FakeRemote(present_nodes, on_nas, ollama_nodes)
+    def make(present_nodes=(), on_nas=False, nas=None, ollama_nodes=(), manifests=None):
+        fr = FakeRemote(present_nodes, on_nas, ollama_nodes, manifests)
         monkeypatch.setattr(remote, "on", fr)
         monkeypatch.setattr(distribution, "verify_model",
                             lambda node, model, delete_bad=False, cache=None: True)
@@ -71,6 +74,41 @@ def test_ensure_no_nas_downloads_on_head_and_replicates(fake, monkeypatch):
     assert pulled == [("org/M", None)]                       # downloaded to the head cache
     worker_pulls = [c for c in fr.cmds(config.HEAD) if "rsync" in c and "fabric" not in c]
     assert any(config.NODES[config.WORKER]["fabric_ip"] in c for c in worker_pulls)
+
+
+FULL = "rev/model-00001.safetensors 10\nrev/model-fp8-mtp-ple.safetensors 53\n"
+PARTIAL = "rev/model-00001.safetensors 10\n"            # the separate PLE shard never arrived
+
+
+def test_ensure_remirrors_partial_copy_that_looks_present(fake, monkeypatch):
+    # worker passes the structural check but lacks a file the head has -> re-mirror from the head,
+    # never a download (the 2026-10-11 Qwen3.8-Flash-Next case: vLLM fetched 53GB at load time)
+    fr = fake(present_nodes=set(config.NODES),
+              manifests={config.HEAD: FULL, config.WORKER: PARTIAL})
+    monkeypatch.setattr(distribution, "_pull_hf", lambda svc, cache=None: pytest.fail("downloaded"))
+    distribution.ensure_models(RECIPE)
+    pushes = [c for c in fr.cmds(config.HEAD) if "rsync" in c]
+    assert pushes and config.NODES[config.WORKER]["fabric_ip"] in pushes[0]
+
+
+def test_ensure_remirrors_partial_copy_after_fresh_head_download(fake, monkeypatch):
+    fr = fake(present_nodes={config.WORKER},
+              manifests={config.HEAD: FULL, config.WORKER: PARTIAL})
+    monkeypatch.setattr(distribution, "_pull_hf", lambda svc, cache=None: True)
+    distribution.ensure_models(RECIPE)
+    assert any("rsync" in c and config.NODES[config.WORKER]["fabric_ip"] in c
+               for c in fr.cmds(config.HEAD))
+
+
+def test_ensure_matching_copies_skip_mirror(fake):
+    fr = fake(present_nodes=set(config.NODES), manifests={config.HEAD: FULL, config.WORKER: FULL})
+    distribution.ensure_models(RECIPE)
+    assert not [c for c in fr.cmds() if "rsync" in c]
+
+
+def test_present_cmd_rejects_dangling_snapshot_links():
+    assert "-xtype l" in distribution._present_cmd("/c", "org/M")
+    assert "-xtype l" in distribution._list_hf_cmd("/c")
 
 
 def test_ensure_replicates_from_nas_path_mode(fake):
@@ -355,3 +393,62 @@ def test_remote_bash_uses_base64_transport(monkeypatch):
     assert "base64 -d | bash" in got["cmd"]                    # no fragile bash -lc "<json>"
     decoded = _b64.b64decode(got["cmd"].split("echo ", 1)[1].split(" |", 1)[0]).decode()
     assert decoded == 'echo "$HOME"; . "$X/secrets.env"'       # script survives verbatim
+
+
+def test_pull_hf_falls_back_to_xet_for_oversized_files(monkeypatch, capsys):
+    # hf refuses a >50GB file without xet (Qwen3.8-Flash-Next's 53.7GB PLE table): the retry must
+    # switch that model to xet instead of burning every attempt on the same unrecoverable error
+    from types import SimpleNamespace as NS
+    starts, codes = [], iter(["1", "0"])
+    monkeypatch.setattr(config, "DL", {"use_xet": False, "max_attempts": 3})
+    monkeypatch.setattr(distribution, "hf_repo_stats", lambda m, cache=None: (None, None))
+    monkeypatch.setattr(distribution, "hf_download_start",
+                        lambda m, cache=None, xet=None: starts.append(xet))
+    monkeypatch.setattr(distribution, "_wait_with_watchdog", lambda *a, **kw: "exited")
+    monkeypatch.setattr(distribution, "verify_model", lambda *a, **kw: True)
+
+    def fake_on(node, cmd, **kw):
+        if "ExitCode" in cmd:
+            return NS(stdout=next(codes), returncode=0)
+        if "docker logs" in cmd:
+            return NS(stdout=f"Error: Invalid value. The file is {distribution.XET_REQUIRED[0]}.\n",
+                      returncode=0)
+        return NS(stdout="", returncode=0)
+    monkeypatch.setattr(distribution.remote, "on", fake_on)
+
+    assert distribution._pull_hf({"model": "org/Big"}) is True
+    assert starts == [None, True]                  # config default first, then forced xet
+    assert "retrying with xet" in capsys.readouterr().out
+
+
+def test_dl_env_xet_override_beats_config(monkeypatch):
+    monkeypatch.setattr(config, "DL", {"use_xet": False})
+    assert "HF_HUB_DISABLE_XET" not in distribution._dl_env(xet=True)
+    assert "HF_XET_HIGH_PERFORMANCE=1" in distribution._dl_env(xet=True)
+
+
+def test_hf_repo_stats_reports_largest_file(monkeypatch):
+    import json as _json
+    from types import SimpleNamespace as NS
+    listing = _json.dumps([{"path": "ple.safetensors", "lfs": {"size": 53_717_551_730}},
+                           {"path": "config.json", "size": 500}])
+    monkeypatch.setattr(distribution.remote, "on", lambda node, cmd, **kw: NS(stdout=listing, returncode=0))
+    assert distribution.hf_repo_stats("org/M") == (53_717_552_230, 53_717_551_730)
+    monkeypatch.setattr(distribution.remote, "on", lambda node, cmd, **kw: NS(stdout="nope", returncode=0))
+    assert distribution.hf_repo_stats("org/M") == (None, None)
+
+
+@pytest.mark.parametrize("largest,expect", [(53_717_551_730, [True]),     # over the cap -> xet up front
+                                            (49_950_112_952, [None])])    # Muse-Glimmer: just under
+def test_pull_hf_picks_xet_up_front_from_file_sizes(monkeypatch, largest, expect):
+    from types import SimpleNamespace as NS
+    starts = []
+    monkeypatch.setattr(config, "DL", {"use_xet": False, "max_attempts": 2})
+    monkeypatch.setattr(distribution, "hf_repo_stats", lambda m, cache=None: (largest, largest))
+    monkeypatch.setattr(distribution, "hf_download_start",
+                        lambda m, cache=None, xet=None: starts.append(xet))
+    monkeypatch.setattr(distribution, "_wait_with_watchdog", lambda *a, **kw: "exited")
+    monkeypatch.setattr(distribution, "verify_model", lambda *a, **kw: True)
+    monkeypatch.setattr(distribution.remote, "on", lambda node, cmd, **kw: NS(stdout="0", returncode=0))
+    assert distribution._pull_hf({"model": "org/M"}) is True
+    assert starts == expect

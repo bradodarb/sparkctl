@@ -19,7 +19,19 @@ _ICON = {ERROR: "❌", WARN: "⚠️ ", INFO: "· "}
 
 # Fields that only the vllm engine honors — set on an ollama service they're silently ignored.
 _VLLM_ONLY = ("parallel", "served_name", "max_model_len", "gpu_memory_utilization",
-              "tool_call_parser", "reasoning_parser", "extra_args")
+              "tool_call_parser", "reasoning_parser", "extra_args",
+              "multimodal", "trust_remote_code", "model_impl",
+              "limit_mm_per_prompt", "mm_processor_kwargs", "tool_parser_plugin", "speculative")
+
+# speculative methods that use a SEPARATE drafter model (need `model:`); mtp/ngram self-speculate.
+_SPEC_NEEDS_MODEL = ("draft_model", "eagle", "eagle3", "dflash", "dspark", "medusa")
+
+# vllm-only service knobs — set on an sglang service they're silently ignored (SGLang has its own
+# flags, passed via extra_args). Distinct from _VLLM_ONLY (which also lists fields sglang DOES honor).
+_SGLANG_IGNORES = ("model_impl", "limit_mm_per_prompt", "mm_processor_kwargs", "tool_parser_plugin",
+                   "distributed_backend", "gpu_memory_utilization")
+
+_MODEL_IMPL = ("auto", "vllm", "transformers")
 
 
 class Finding:
@@ -75,6 +87,29 @@ def lint_recipe(recipe, *, known_nodes=None, head=None, known_images=None):
     def add(level, message, suggestion=None, fix=None):
         out.append(Finding(level, message, suggestion, fix))
 
+    def check_speculative(svc, label):
+        """Shared by vllm + sglang — same recipe shape, different flag emission downstream."""
+        spec = svc.get("speculative")
+        if spec is None:
+            return
+        if not isinstance(spec, dict):
+            add(ERROR, f"{label}: 'speculative' must be a mapping (got {type(spec).__name__})",
+                "e.g. speculative: {method: dflash, model: <repo>, num_speculative_tokens: 15}")
+        elif not spec.get("method"):
+            add(ERROR, f"{label}: 'speculative' needs a 'method' (ngram | mtp | eagle | dflash | dspark | ...)",
+                "add method: <method>")
+        elif spec["method"] in _SPEC_NEEDS_MODEL and not spec.get("model"):
+            add(ERROR, f"{label}: speculative method '{spec['method']}' needs a drafter 'model'",
+                "add model: <drafter-repo> (it auto-downloads to every node on apply)")
+
+    def check_pinned_image(svc, label):
+        """A pinned image must be the cluster default or a declared cluster.images variant, else
+        `apply` stops at the presence preflight. WARN (not error): it could be hand-built on nodes."""
+        if known_images is not None and svc.get("image") and svc["image"] not in known_images:
+            add(WARN, f"{label}: pinned image '{svc['image']}' is not the cluster default nor a "
+                f"declared cluster.images variant — apply will fail unless it's built on the nodes",
+                "declare it under cluster.images then `sparkctl build <image>`, or drop image:")
+
     if not isinstance(recipe, dict):
         return [Finding(ERROR, "recipe is not a mapping")]
     if not recipe.get("name"):
@@ -88,9 +123,9 @@ def lint_recipe(recipe, *, known_nodes=None, head=None, known_images=None):
     for i, svc in enumerate(services):
         label = svc.get("name") or f"services[{i}]"
         engine = svc.get("engine")
-        if engine not in ("vllm", "ollama"):
-            add(ERROR, f"{label}: engine must be 'vllm' or 'ollama' (got {engine!r})",
-                "set engine: vllm  (or engine: ollama)")
+        if engine not in ("vllm", "sglang", "ollama"):
+            add(ERROR, f"{label}: engine must be 'vllm', 'sglang', or 'ollama' (got {engine!r})",
+                "set engine: vllm  (or engine: sglang / ollama)")
             continue
         if not svc.get("model"):
             add(ERROR, f"{label}: missing 'model'", "add model: <hf-repo or ollama name>")
@@ -100,6 +135,34 @@ def lint_recipe(recipe, *, known_nodes=None, head=None, known_images=None):
         env = svc.get("env") or {}
         extra = svc.get("extra_args") or []
         node = svc.get("node")
+
+        # `nodes: [...]` fans this service out to one single-node replica per node (same served_name
+        # -> gateway load-balances them). Lint the authored form here; expand_services enforces the
+        # hard cases at load time too.
+        nodes = svc.get("nodes")
+        if nodes is not None:
+            if node:
+                add(ERROR, f"{label}: set either 'node:' or 'nodes:', not both",
+                    "'nodes:' fans out to per-node replicas; 'node:' pins a single one — pick one")
+            if not isinstance(nodes, list) or not nodes:
+                add(ERROR, f"{label}: 'nodes' must be a non-empty list of node names",
+                    "e.g. nodes: [coach, ref]")
+            else:
+                if world >= 2:
+                    add(ERROR, f"{label}: 'nodes:' replicates a single-node service per node, but "
+                        f"parallel.tensor/pipeline>=2 already spans nodes",
+                        "drop 'parallel' (per-node replicas) or 'nodes:' (one multinode service)")
+                if known_nodes:
+                    for n in nodes:
+                        if n not in known_nodes:
+                            add(ERROR, f"{label}: nodes entry '{n}' is not in cluster.yaml nodes "
+                                f"({', '.join(sorted(known_nodes))})",
+                                f"use one of: {', '.join(sorted(known_nodes))}")
+                dupes = sorted({n for n in nodes if nodes.count(n) > 1})
+                if dupes:
+                    add(WARN, f"{label}: duplicate node(s) in 'nodes': {', '.join(dupes)} "
+                        f"(each node gets one replica regardless)", "remove the duplicate(s)",
+                        fix=lambda s=svc: s.__setitem__("nodes", list(dict.fromkeys(s["nodes"]))))
 
         if engine == "ollama":
             for f in _VLLM_ONLY:
@@ -111,6 +174,31 @@ def lint_recipe(recipe, *, known_nodes=None, head=None, known_images=None):
                     "set provider: ollama", fix=lambda s=svc: s.__setitem__("provider", "ollama"))
             if not node:
                 add(INFO, f"{label}: no 'node' set — ollama defaults to the head")
+        elif engine == "sglang":
+            # single-node OpenAI server (python3 -m sglang.launch_server). Cross-engine fields
+            # (served_name / max_model_len -> --context-length / tool+reasoning parser / speculative)
+            # are first-class; SGLang-specific knobs ride in extra_args verbatim.
+            if provider not in (None, "hf"):
+                add(WARN, f"{label}: sglang engine expects provider 'hf' (got {provider!r})",
+                    "set provider: hf", fix=lambda s=svc: s.__setitem__("provider", "hf"))
+            if world >= 2:
+                # this engine has no multi-node fabric path (1 GPU/node on Spark). SGLang's own TP is
+                # intra-node only here; use a vllm service for tensor-parallel across the two nodes.
+                add(ERROR, f"{label}: the sglang engine is single-node only (1 GPU/node on Spark); "
+                    f"parallel.tensor/pipeline>=2 isn't supported",
+                    "drop 'parallel' (use 'nodes:' for per-node replicas, or a vllm service for multinode TP)")
+            mml = svc.get("max_model_len")
+            if mml is not None and (not isinstance(mml, int) or mml <= 0):
+                add(ERROR, f"{label}: max_model_len must be a positive integer (got {mml!r})",
+                    "set a positive integer, e.g. 131072  (emitted as --context-length)")
+            for fld in _SGLANG_IGNORES:
+                if fld in svc:
+                    add(WARN, f"{label}: '{fld}' is a vllm-only knob with no effect on an sglang service",
+                        f"remove '{fld}' — SGLang uses its own flag via extra_args "
+                        f"(e.g. --mem-fraction-static, --kv-cache-dtype)",
+                        fix=lambda s=svc, k=fld: s.pop(k, None))
+            check_speculative(svc, label)   # dict -> --speculative-algorithm/--speculative-draft-model-path
+            check_pinned_image(svc, label)
         else:  # vllm
             if provider not in (None, "hf"):
                 add(WARN, f"{label}: vllm engine expects provider 'hf' (got {provider!r})",
@@ -185,13 +273,32 @@ def lint_recipe(recipe, *, known_nodes=None, head=None, known_images=None):
                         "remove env RAY_memory_monitor_refresh_ms",
                         fix=lambda s=svc: _del_env(s, "RAY_memory_monitor_refresh_ms"))
 
-            # A pinned image must be buildable (the cluster default or a declared cluster.images
-            # variant) — otherwise `sparkctl apply` stops at the presence preflight. Static WARN: the
-            # image could still be hand-built on the nodes, so don't hard-error.
-            if known_images is not None and svc.get("image") and svc["image"] not in known_images:
-                add(WARN, f"{label}: pinned image '{svc['image']}' is not the cluster default nor a "
-                    f"declared cluster.images variant — apply will fail unless it's built on the nodes",
-                    "declare it under cluster.images then `sparkctl build <image>`, or drop image:")
+            check_pinned_image(svc, label)
+
+            # ── multimodal / model-implementation knobs (VLMs) ──────────────────────────────────
+            impl = svc.get("model_impl")
+            if impl is not None and impl not in _MODEL_IMPL:
+                add(ERROR, f"{label}: model_impl must be one of {', '.join(_MODEL_IMPL)} (got {impl!r})",
+                    "set model_impl: transformers  (vLLM's generic backend for archs it lacks a native class for)")
+            for f in ("limit_mm_per_prompt", "mm_processor_kwargs"):
+                v = svc.get(f)
+                if v is not None and not isinstance(v, dict):
+                    add(ERROR, f"{label}: '{f}' must be a mapping (got {type(v).__name__})",
+                        f"e.g. {f}: {{image: 4}}" if f == "limit_mm_per_prompt" else f"{f}: {{...}}")
+            mm = svc.get("multimodal")
+            if mm is not None and not isinstance(mm, bool):
+                add(ERROR, f"{label}: 'multimodal' must be true/false (got {mm!r})", "set multimodal: true")
+            if mm and svc.get("limit_mm_per_prompt") is None:
+                add(INFO, f"{label}: multimodal service with no 'limit_mm_per_prompt' — vLLM defaults to 1 "
+                    f"image/prompt, which may truncate multi-image requests",
+                    "set limit_mm_per_prompt: {image: N} to allow more media per request")
+            check_speculative(svc, label)   # dict -> --speculative-config JSON
+
+            # a tool-parser plugin only registers a parser; you still have to SELECT it by name.
+            if svc.get("tool_parser_plugin") and not svc.get("tool_call_parser"):
+                add(WARN, f"{label}: tool_parser_plugin is set but tool_call_parser is not — the plugin "
+                    f"loads a parser vLLM never selects, so tool calls won't be parsed",
+                    "set tool_call_parser to the name the plugin registers (e.g. atem)")
 
             # VLLM_USE_FLASHINFER_MOE_FP4 is deprecated in vLLM >= 0.22 and model-specific: some NVFP4
             # MoEs (e.g. Gemma-4) have no FlashInfer FP4 backend, so forcing it raises
@@ -262,7 +369,6 @@ def cmd_validate(args):
     """Lint one recipe (by name) or every recipe in recipes/. With --fix, apply the auto-fixable
     findings and write the file back. Exits 1 if any error remains."""
     from sparkctl import config
-    from sparkctl.recipes import load_recipe
 
     if args.recipe:
         names = [args.recipe]
@@ -276,8 +382,12 @@ def cmd_validate(args):
     total_err = total_warn = total_fixed = 0
     for name in names:
         path = config.ROOT / "recipes" / f"{name}.yaml"
-        recipe = load_recipe(name)   # exits with a clear message if a named recipe is missing
-        findings = lint_recipe(recipe, known_nodes=kn, head=head, known_images=config.IMAGES)
+        if not path.exists():
+            print(f"recipe: {name}\n  {_ICON[ERROR]} no such recipe: {path}")
+            total_err += 1
+            continue
+        recipe = yaml.safe_load(path.read_text())   # authored form: lint (and --fix) the compact
+        findings = lint_recipe(recipe, known_nodes=kn, head=head, known_images=config.IMAGES)   # `nodes:` a user wrote, never the expanded copies
         print(f"recipe: {name}")
         for line in format_findings(findings):
             print(line)

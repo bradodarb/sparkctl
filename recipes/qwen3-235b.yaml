@@ -13,7 +13,7 @@ services:
     parallel:
       tensor: 2
     port: 8000
-    max_model_len: 40960                      # model's native max_position_embeddings (no YaRN configured)
+    max_model_len: 131072                     # YaRN-extended (3.2x the 40960 native) — see --hf-overrides below
     gpu_memory_utilization: 0.85              # unified memory is shared w/ system+downloads; 0.9 overruns
     tool_call_parser: hermes                  # Qwen3 (non-Coder) uses the hermes tool parser in vLLM
     reasoning_parser: qwen3
@@ -24,6 +24,16 @@ services:
       #   --load-format=safetensors + --safetensors-load-strategy=eager  (also disables mmap)
       - --load-format=fastsafetensors
       - --trust-remote-code
+      # YaRN RoPE scaling to reach 131072 ctx (native is 40960, no YaRN baked into the checkpoint).
+      # vLLM 0.22.1 has no --rope-scaling flag; set it via --hf-overrides. factor 3.2 x 40960 = 131072.
+      # Single quotes around the JSON are REQUIRED: the ssh->docker->bash layers otherwise strip the
+      # double quotes and bash brace-expands {a,b} into separate args (same trap as speculative-config).
+      # Static YaRN mildly softens short-context quality — acceptable since 128k is the common case.
+      - "--hf-overrides='{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":3.2,\"original_max_position_embeddings\":40960}}'"
+      # fp8 KV cache: at 131072 ctx, bf16 KV is ~12.6GB/rank per sequence (only ~2 fit the ~36GB pool);
+      # fp8 halves it to ~6.3GB (~5 fit) for a small quality cost. Raising max_model_len needs no extra
+      # memory (the KV pool is fixed by gpu_memory_utilization) — it trades concurrency, not headroom.
+      - --kv-cache-dtype=fp8
     env:
       VLLM_USE_FLASHINFER_MOE_FP4: "1"
       # On GB10 unified memory, weights+KV count as system RAM, so Ray's default ~95% memory

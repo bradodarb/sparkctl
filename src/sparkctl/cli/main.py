@@ -36,7 +36,7 @@ from sparkctl.deploy import deploy, deploy_init
 from sparkctl.distribution import mirror_to_others
 from sparkctl.manifest import verify_deployment, write_active_manifest
 from sparkctl.recipes import current_recipe, load_recipe, recipe_hash
-from sparkctl.server.lifecycle import cmd_serve, refresh_server_if_running
+from sparkctl.server.lifecycle import cmd_serve, refresh_or_start_server
 
 # Removed verbs -> where their behavior lives now. Clean cutover: hint + exit 2, no forwarding.
 REMOVED = {
@@ -245,29 +245,38 @@ def build_parser():
 
 # ---------------------------------------------------------------- control-machine (Mac) mode
 def _image_targets():
-    """(tag, dockerfile) images `build` produces: the cluster default first, then any declared
-    variants from cluster.images ({tag: {dockerfile: <name in docker/>}}). Variants let a recipe pin
-    a different engine build (e.g. a newer vLLM) via a service `image:` without disturbing the fleet."""
-    targets = [(config.IMAGE, "Dockerfile")]
+    """(tag, dockerfile, pull) images `build` produces: the cluster default first, then any declared
+    variant from cluster.images. A variant is either BUILT from a Dockerfile
+    ({tag: {dockerfile: <name in docker/>}}) or PULLED from a registry and retagged locally
+    ({tag: {pull: <registry-ref>}}, e.g. an official upstream image with native support for a new
+    arch). Exactly one of dockerfile/pull applies; pull wins if both are given. Variants let a recipe
+    pin a different engine via a service `image:` without disturbing the fleet."""
+    targets = [(config.IMAGE, "Dockerfile", None)]
     for tag, spec in (config.CFG["cluster"].get("images") or {}).items():
-        targets.append((tag, (spec or {}).get("dockerfile", "Dockerfile")))
+        spec = spec or {}
+        pull = spec.get("pull")
+        targets.append((tag, None if pull else spec.get("dockerfile", "Dockerfile"), pull))
     return targets
 
 
 def build(only=None):
     targets = _image_targets()
     if only:
-        targets = [(t, df) for t, df in targets if t == only]
+        targets = [t for t in targets if t[0] == only]
         if not targets:
-            known = ", ".join(t for t, _ in _image_targets())
+            known = ", ".join(t for t, _, _ in _image_targets())
             sys.exit(f"[build] unknown image '{only}' — declare it under cluster.images "
                      f"(known: {known})")
     for node in config.NODES:
         a = remote.node_addr(node)
-        for tag, dockerfile in targets:
-            print(f"[build] {node} -> {tag} ({dockerfile})")
-            remote.sh(f"ssh {config.USER}@{a} 'docker build -t {tag} "
-                      f"-f {config.REMOTE}/docker/{dockerfile} {config.REMOTE}/docker'")
+        for tag, dockerfile, pull in targets:
+            if pull:   # official/upstream image: pull it and retag to the local name recipes pin
+                print(f"[build] {node} -> {tag} (pull {pull})")
+                remote.sh(f"ssh {config.USER}@{a} 'docker pull {pull} && docker tag {pull} {tag}'")
+            else:
+                print(f"[build] {node} -> {tag} ({dockerfile})")
+                remote.sh(f"ssh {config.USER}@{a} 'docker build -t {tag} "
+                          f"-f {config.REMOTE}/docker/{dockerfile} {config.REMOTE}/docker'")
 
 
 def run_node(node, argv):
@@ -329,7 +338,7 @@ def control_main(argv):
     rc = run_head(argv)
     # keep a dev-machine-local server in sync after a deployment change
     if cmd == "apply" and config.SERVER.get("host", "local") == "local":
-        refresh_server_if_running()
+        refresh_or_start_server()
     if rc:                       # a failed forwarded command (e.g. apply --wait crash) must
         sys.exit(rc)             # propagate — scripts and CI depend on the exit code
 

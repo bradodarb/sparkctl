@@ -17,23 +17,13 @@
 # `content` (most visibly on the between-tool-call planning turns) and break OpenAI-style harnesses.
 name: gemma-4-26b-nvfp4
 services:
-- name: agent-coach
+- name: agent
   engine: vllm
   provider: hf
   model: nvidia/Gemma-4-26B-A4B-NVFP4
   served_name: gemma-4-26b-nvfp4
-  node: coach
-  port: 8000
-  max_model_len: 65536
-  gpu_memory_utilization: 0.85
-  tool_call_parser: gemma4
-  reasoning_parser: gemma4
-- name: agent-ref
-  engine: vllm
-  provider: hf
-  model: nvidia/Gemma-4-26B-A4B-NVFP4
-  served_name: gemma-4-26b-nvfp4
-  node: ref
+  nodes: [coach, ref]           # one single-node replica per node (agent-coach / agent-ref),
+                                # same served_name -> gateway load-balances the two endpoints
   port: 8000
   max_model_len: 65536
   gpu_memory_utilization: 0.85

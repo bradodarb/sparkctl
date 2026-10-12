@@ -1,0 +1,27 @@
+# Qwen3.8-27B (Qwen, Aug 2026) — dense 27B multimodal VLM (arch Qwen3_5ForConditionalGeneration,
+# model_type qwen3_5): bf16 text tower + a ViT vision encoder (mRoPE), thinking-on-by-default,
+# 262k native context (YaRN-extensible to 1M). Brand-new arch -> needs a purpose-built image:
+# vllm/vllm-openai:qwen38-arm64-cu130 (GB10 = aarch64/CUDA13), declared as csv-vllm:qwen38 in
+# cluster.yaml so `sparkctl apply` auto-pulls it. Stock nvcr 26.06/26.07 images lack this arch.
+name: qwen3.8-27b
+services:
+- name: agent
+  engine: vllm
+  provider: hf
+  model: Qwen/Qwen3.8-27B
+  served_name: qwen3.8-27b
+  image: csv-vllm:qwen38            # purpose-built vLLM image w/ native qwen3_5 arch + vision
+  nodes: [coach, ref]              # one single-node (TP=1) replica per node -> gateway load-balances
+  port: 8000
+  max_model_len: 131072            # conservative default; native is 262144. bf16 27B (~54GB) + 262k KV
+                                   # is heavy on 128GB unified memory — bump toward 262144 if it loads.
+  gpu_memory_utilization: 0.85     # unified memory shared w/ OS; leave headroom for KV + the vision tower
+  multimodal: true                 # declares vision to the gateway (LiteLLM supports_vision)
+  limit_mm_per_prompt: {image: 4}  # up to 4 images/request; add `video: 1` for video (Qwen-VL supports it)
+  tool_call_parser: qwen3_coder         # Qwen3 function-calling format in vLLM
+  reasoning_parser: qwen3          # splits the <think>…</think> channel into reasoning_content
+  extra_args:
+  - --generation-config auto       # use the model's own sampling defaults (thinking: temp 1.0/top_p 0.95/top_k 20)
+  # 1M context: set max_model_len: 1000000, add env VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1", and a YaRN
+  # rope override via extra_args: --hf-overrides '{"rope_parameters":{"rope_type":"yarn","factor":4.0,
+  # "original_max_position_embeddings":262144}}'. Won't fit alongside big KV on one GB10 at high concurrency.

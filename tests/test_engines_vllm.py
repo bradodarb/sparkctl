@@ -65,6 +65,8 @@ def test_vllm_up_single_node(monkeypatch):
     node, cmd = calls[0]
     assert node == "coach"
     assert "docker run" in cmd
+    assert "--entrypoint bash" in cmd                   # works even if base image sets ENTRYPOINT ["vllm"]
+    assert f"{config.IMAGE} -lc " in cmd                # command is `-lc <serve>`, not `bash -lc <serve>`
     assert vllm.svc_cname("agent") in cmd
     assert "vllm serve org/M" in cmd
     assert "ray start" not in cmd                       # single-node path must not use Ray
@@ -139,3 +141,54 @@ def test_vllm_up_multinode_defaults_to_ray_not_mp(monkeypatch):
     allcmds = " ".join(c for _, c in calls)
     assert "ray start --head" in allcmds
     assert "--distributed-executor-backend mp" not in allcmds
+
+
+# ---- multimodal / model-impl engine flags ---------------------------------
+def test_engine_extra_flags_multimodal_and_impl():
+    f = vllm._vllm_serve_flags(_svc(trust_remote_code=True, model_impl="transformers",
+                                    limit_mm_per_prompt={"image": 4},
+                                    mm_processor_kwargs={"foo": "bar"}))
+    assert "--trust-remote-code" in f
+    assert "--model-impl transformers" in f
+    # JSON is single-quoted so it survives ssh->docker->bash as one literal arg
+    assert "--limit-mm-per-prompt='{\"image\":4}'" in f
+    assert "--mm-processor-kwargs='{\"foo\":\"bar\"}'" in f
+
+
+def test_engine_extra_flags_absent_by_default():
+    f = vllm._vllm_serve_flags(_svc(tool_call_parser=None))
+    for x in ("--trust-remote-code", "--model-impl", "--limit-mm-per-prompt", "--mm-processor-kwargs"):
+        assert x not in f
+
+
+def test_worker_flags_mirror_engine_level_mm():
+    # headless mp workers must get the SAME engine-shaping flags as the head (or ranks diverge)
+    svc = _svc(trust_remote_code=True, model_impl="transformers", limit_mm_per_prompt={"image": 2})
+    wf = vllm._worker_engine_flags(svc)
+    assert "--model-impl transformers" in wf
+    assert "--trust-remote-code" in wf
+    assert "--limit-mm-per-prompt='{\"image\":2}'" in wf
+    # but NOT the API-server-only flags
+    assert "--served-model-name" not in wf and "--host" not in wf
+
+
+def test_tool_parser_plugin_flag_emitted():
+    f = vllm._vllm_serve_flags(_svc(tool_parser_plugin="/opt/p/atem.py", tool_call_parser="atem"))
+    assert "--tool-parser-plugin /opt/p/atem.py" in f
+    assert "--enable-auto-tool-choice" in f and "--tool-call-parser atem" in f
+    # plugin must be loaded BEFORE the parser is selected
+    assert f.index("--tool-parser-plugin") < f.index("--tool-call-parser")
+
+
+def test_speculative_config_flag_shell_safe():
+    f = vllm._vllm_serve_flags(_svc(speculative={"method": "dflash",
+                                                  "model": "org/drafter", "num_speculative_tokens": 15}))
+    # single-quoted JSON so it survives ssh->docker->bash as one arg
+    assert "--speculative-config='{\"method\":\"dflash\",\"model\":\"org/drafter\",\"num_speculative_tokens\":15}'" in f
+
+
+def test_docker_common_passes_rdma_devices_when_present():
+    # without /dev/infiniband NCCL silently falls back to TCP sockets across the fabric (~2x slower
+    # TP decode); the flag is gated on the node actually having the device ($() expands on-node)
+    common = vllm._docker_common()
+    assert "test -d /dev/infiniband && echo --device=/dev/infiniband --cap-add=IPC_LOCK" in common

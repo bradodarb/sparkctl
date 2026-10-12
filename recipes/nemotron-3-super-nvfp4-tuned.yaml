@@ -1,0 +1,45 @@
+# Token-gen tuning variant of nemotron-3-super-nvfp4 — A/B against the baseline with bin/loadgen.py.
+# Nemotron-H hybrid (88 layers: 40 Mamba2 + 40 MoE + 8 attention). Decode is memory-bandwidth bound
+# on GB10 (~273 GB/s), so the levers here either emit more tokens per weight-read (MTP speculative)
+# or amortize the read across more concurrent tokens (batching). KV is tiny (only 8 attn layers), so
+# fp8-KV / low max-num-seqs — the knobs that matter on qwen3-235b — are irrelevant here.
+name: nemotron-3-super-nvfp4-tuned
+services:
+  - name: agent
+    engine: vllm
+    provider: hf
+    model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+    served_name: nemotron-3-super-nvfp4-tuned
+    nodes: [coach, ref]             # one single-node replica per node -> gateway load-balances
+    port: 8000
+    max_model_len: 262144           # native (no YaRN); cheap here since KV is tiny (8 attn layers)
+    gpu_memory_utilization: 0.85
+    tool_call_parser: qwen3_coder
+    reasoning_parser: nemotron_v3   # Nemotron-3-Super reasoning parser (vLLM name; not "super_v3")
+    extra_args:
+      - --trust-remote-code
+      - --load-format=safetensors   # single-node -> streamed (NOT fastsafetensors, NOT eager)
+      # ── lever ① MTP speculative decode: the model ships 1 MTP head (num_nextn_predict_layers=1),
+      # so vLLM drafts+verifies extra tokens per forward pass. Biggest single-stream win. Same
+      # ssh->docker->bash quoting trap as deepseek: single-quote the JSON or bash brace-expands it.
+      # Start at 1; try 2 (the head can run autoregressively) and watch the accept rate.
+      - "--speculative-config='{\"method\":\"mtp\",\"num_speculative_tokens\":1}'"
+      # ── lever ② batching/concurrency: tiny per-request state (KV=8 layers + constant Mamba state)
+      # means we can hold many sequences and amortize the big MoE weight-read -> aggregate throughput.
+      - --max-num-seqs=32
+      - --max-num-batched-tokens=8192
+      # ── lever ⑤ prefix caching: skip re-prefill of a stable system prompt across agent turns.
+      # Partial win on this hybrid (Mamba state isn't prefix-cacheable like KV), still worth it.
+      - --enable-prefix-caching
+      - --enable-chunked-prefill
+    # NOTE vs baseline: dropped --safetensors-load-strategy=eager (host-RAM OOM risk, no gen benefit)
+    # and env VLLM_USE_FLASHINFER_MOE_FP4=1 (deprecated in vLLM>=0.22) — let vLLM auto-select the
+    # NVFP4 MoE backend. If MoE load fails, pin one explicitly with --moe-backend=<kernel>.
+    # Never add --enforce-eager: it kills CUDA-graph capture (esp. costly for the Mamba scan).
+
+  - name: embeddings
+    engine: ollama
+    provider: ollama
+    node: ref
+    model: nomic-embed-text
+    port: 11434

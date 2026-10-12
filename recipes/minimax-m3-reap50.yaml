@@ -9,6 +9,9 @@ services:
     provider: hf
     model: sparkarena/Minimax-M3-v0-NVFP4-REAP50
     served_name: minimax-m3
+    image: csv-vllm:26.07-ray     # vLLM 0.24.0: the minimax_m3 tool+reasoning parsers this recipe
+                                  # uses don't exist in the 0.22.1 default image (build it first:
+                                  # sparkctl build csv-vllm:26.07-ray)
     parallel:
       tensor: 2
     port: 8000

@@ -9,7 +9,7 @@ import time
 
 from sparkctl import config, remote
 from sparkctl.engines.ollama import ollama_ensure
-from sparkctl.recipes import svc_provider
+from sparkctl.recipes import speculative_model, svc_provider
 
 
 def dl_cname(model):
@@ -33,10 +33,11 @@ def _fmt_dur(sec):
     return f"{h}h{m:02d}m" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
 
 
-def hf_repo_size(model, cache=None):
-    """Best-effort total download size (bytes) for progress display, from the HF API on the head
-    with the configured token. None when it can't be determined (gated/offline/rate-limited) — the
-    caller then shows a size+rate line without a percentage. Never fatal, never touches weights."""
+def hf_repo_stats(model, cache=None):
+    """Best-effort (total bytes, largest file bytes) from the HF API on the head with the configured
+    token — total drives the progress %/ETA, largest decides whether the download needs xet.
+    (None, None) when it can't be determined (gated/offline/rate-limited) — the caller then shows a
+    size+rate line without a percentage and relies on the reactive xet fallback. Never fatal."""
     inner = ('set -a; [ -f "$HOME/.sparkctl/secrets.env" ] && . "$HOME/.sparkctl/secrets.env"; set +a; '
              f'curl -sfL --max-time 20 ${{HF_TOKEN:+-H "Authorization: Bearer $HF_TOKEN"}} '
              f'"https://huggingface.co/api/models/{model}/tree/main?recursive=true"')
@@ -44,29 +45,42 @@ def hf_repo_size(model, cache=None):
     try:
         items = json.loads(out)
     except (ValueError, TypeError):
-        return None
+        return None, None
     if not isinstance(items, list):
-        return None
-    total = sum((it.get("lfs") or {}).get("size") or it.get("size") or 0 for it in items
-                if isinstance(it, dict))
-    return total or None
+        return None, None
+    sizes = [(it.get("lfs") or {}).get("size") or it.get("size") or 0 for it in items
+             if isinstance(it, dict)]
+    return (sum(sizes) or None), (max(sizes, default=0) or None)
 
 
-def _dl_env():
+def hf_repo_size(model, cache=None):
+    """Best-effort total download size (bytes); None when unknown. See hf_repo_stats."""
+    return hf_repo_stats(model, cache=cache)[0]
+
+
+# huggingface_hub refuses files over MAX_HTTP_DOWNLOAD_SIZE (50GB decimal — e.g. Qwen3.8-Flash-Next's
+# 53.7GB PLE table) without xet; no retry of the plain downloader can ever succeed. _pull_hf switches
+# a model to xet PROACTIVELY when the HF API lists such a file, and REACTIVELY if the download fails
+# with hf's error anyway (API unreachable, or hf lowers the cap) — either way, no operator action.
+HTTP_MAX_FILE = 50 * 1000 * 1000 * 1000
+XET_REQUIRED = ("too large to be downloaded using the regular download method", "pip install hf_xet")
+
+
+def _dl_env(xet=None):
     """Research-backed robustness env for HF downloads: the modern hf-xet backend has known stalls,
     and the plain downloader honors HF_HUB_DOWNLOAD_TIMEOUT (a hung read -> retryable TimeoutError).
-    Disable xet by default + set finite timeouts. Pure/testable."""
+    Disable xet by default + set finite timeouts. `xet` overrides download.use_xet. Pure/testable."""
     dl = config.DL
     e = [f"-e HF_HUB_DOWNLOAD_TIMEOUT={dl.get('request_timeout', 60)}",
          f"-e HF_HUB_ETAG_TIMEOUT={dl.get('etag_timeout', 30)}"]
-    if not dl.get("use_xet", False):
+    if not (dl.get("use_xet", False) if xet is None else xet):
         e.append("-e HF_HUB_DISABLE_XET=1")
     else:
         e.append("-e HF_XET_HIGH_PERFORMANCE=1")   # xet: parallel chunked range-GETs (fast path)
     return " ".join(e)
 
 
-def hf_download_start(model, cache=None):
+def hf_download_start(model, cache=None, xet=None):
     """Start a detached, resumable, authenticated HF download container on HEAD. Returns its name.
     Runs as the invoking user (cache stays user-owned for the fabric mirror). Sources secrets
     (`sparkctl secret set HF_TOKEN`; legacy ~/.hugging_face.sh still honored) and passes the token
@@ -82,7 +96,7 @@ def hf_download_start(model, cache=None):
              f'docker rm -f {name} >/dev/null 2>&1 || true; '
              f'docker run -d --name {name} --user "$(id -u):$(id -g)" '
              f'-e HOME=/cache -e HF_HOME=/cache -e XDG_CACHE_HOME=/cache '
-             f'${{HF_TOKEN:+-e HF_TOKEN}} {_dl_env()} -v {cache or config.CACHE}:/cache {config.IMAGE} '
+             f'${{HF_TOKEN:+-e HF_TOKEN}} {_dl_env(xet)} -v {cache or config.CACHE}:/cache {config.IMAGE} '
              f'hf download {model}{wflag} >/dev/null')
     remote.bash(config.HEAD, inner)   # base64 transport — bash -lc quoting silently dropped the token
     return name
@@ -142,21 +156,31 @@ def _pull_hf(svc, cache=None):
     m = svc["model"]
     name = dl_cname(m)
     attempts = config.DL.get("max_attempts", 4)
-    total = hf_repo_size(m, cache=cache)   # best-effort, for the progress %/ETA; None -> size+rate
+    total, largest = hf_repo_stats(m, cache=cache)   # best-effort; None -> size+rate, reactive xet
+    xet = None                             # None -> download.use_xet; True once a file demands it
+    if largest and largest > HTTP_MAX_FILE and not config.DL.get("use_xet", False):
+        xet = True
+        print(f"[pull:hf] {m} has a {_human(largest)} file (> 50GB plain-HTTP cap) — using xet")
     for attempt in range(1, attempts + 1):
         print(f"[pull:hf] {m} -> {config.HEAD} (download attempt {attempt}/{attempts}"
               + (f", {_human(total)} total)" if total else ")"))
-        hf_download_start(m, cache=cache)
+        hf_download_start(m, cache=cache, xet=xet)
         if _wait_with_watchdog(name, m, cache=cache, total=total) == "stalled":
             print("[pull:hf] stalled — resuming from partial")
             continue                                 # watchdog already removed the container
         rc = remote.on(config.HEAD, f"docker inspect -f '{{{{.State.ExitCode}}}}' {name}",
                        capture=True, check=False).stdout.strip()
         if rc != "0":
-            remote.on(config.HEAD, f"docker logs --tail 10 {name}", check=False)
+            logs = remote.on(config.HEAD, f"docker logs --tail 10 {name} 2>&1",
+                             check=False, capture=True).stdout or ""
+            print(logs, end="", flush=True)
         remote.on(config.HEAD, f"docker rm {name}", check=False)
         if rc != "0":
-            print(f"[pull:hf] download exit={rc}; retrying")
+            if not xet and any(marker in logs for marker in XET_REQUIRED):
+                xet = True
+                print("[pull:hf] a file is too large for the plain downloader — retrying with xet")
+            else:
+                print(f"[pull:hf] download exit={rc}; retrying")
             continue
         print("[pull:hf] verifying integrity (sha256 == blob name) ...")
         if verify_model(config.HEAD, m, cache=cache):
@@ -204,15 +228,52 @@ def _nas_mode(nas):
 
 
 def _present_cmd(cache, model):
-    """Fast structural presence check: a populated snapshot and no partial downloads. Full sha256
-    verification stays where it belongs — after every transfer, not on every apply."""
+    """Fast structural presence check: a populated snapshot, no partial downloads, and no dangling
+    snapshot symlinks (a file whose blob never arrived). Full sha256 verification stays where it
+    belongs — after every transfer, not on every apply. Structure alone can't see a file that was
+    never copied at all; _diverged_from_head covers that by comparing against the head's copy."""
     hub = f"{cache}/{_hub_dir(model)}"
     return (f'test -d {hub}/snapshots && [ -n "$(ls -A {hub}/snapshots 2>/dev/null)" ] '
-            f'&& [ -z "$(find {hub} -name \'*.incomplete\' -print -quit 2>/dev/null)" ]')
+            f'&& [ -z "$(find {hub} -name \'*.incomplete\' -print -quit 2>/dev/null)" ] '
+            f'&& [ -z "$(find {hub}/snapshots -xtype l -print -quit 2>/dev/null)" ]')
 
 
 def model_present(node, model):
     return remote.on(node, _present_cmd(config.CACHE, model), check=False, capture=True).returncode == 0
+
+
+def _manifest_cmd(cache, model):
+    """Every snapshot file as '<rev>/<path> <bytes>' (symlinks followed), sorted — the listing two
+    complete copies of a model must agree on. A dangling link isn't -type f, so it shows as a diff."""
+    hub = f"{cache}/{_hub_dir(model)}"
+    return f'cd {hub}/snapshots && find -L . -type f -printf "%P %s\\n" | LC_ALL=C sort'
+
+
+def model_manifest(node, model):
+    r = remote.on(node, _manifest_cmd(config.CACHE, model), check=False, capture=True)
+    return (r.stdout or "") if r.returncode == 0 else None
+
+
+def _diverged_from_head(model, missing):
+    """Nodes that pass the structural check but whose copy differs from the head's. A partial mirror
+    (interrupted transfer, or a repo file outside model.safetensors.index.json — e.g.
+    Qwen3.8-Flash-Next's separate 53GB PLE shard) looks 'present' yet makes vLLM download the rest at
+    load time. The head's snapshot is the reference (it's where verified downloads land); a node whose
+    file listing (names + sizes) differs is re-mirrored. Returns [] when the head lacks the model."""
+    if config.HEAD in missing:
+        return []
+    ref = model_manifest(config.HEAD, model)
+    if not ref:
+        return []
+    out = []
+    for node in config.NODES:
+        if node == config.HEAD or node in missing:
+            continue
+        if model_manifest(node, model) != ref:
+            print(f"[ensure] {model}: {node}'s copy differs from {config.HEAD}'s "
+                  f"(missing or partial files) — re-mirroring")
+            out.append(node)
+    return out
 
 
 def _ollama_manifest(model):
@@ -243,6 +304,7 @@ def _list_hf_cmd(cache):
     return (f'cd {cache}/hub 2>/dev/null && for d in models--*; do '
             f'[ -n "$(ls -A "$d/snapshots" 2>/dev/null)" ] && '
             f'[ -z "$(find "$d" -name \'*.incomplete\' -print -quit 2>/dev/null)" ] && '
+            f'[ -z "$(find "$d/snapshots" -xtype l -print -quit 2>/dev/null)" ] && '
             f'echo "$d"; done; true')
 
 
@@ -463,10 +525,43 @@ def prune_model_cache(model, nodes=None):
             print(f"[prune] {node}: {model} — {out}")
 
 
+def _ensure_one_hf(svc, nas):
+    """Pull-if-missing for a single hf model (svc['model']): check nodes -> NAS -> download, then
+    replicate from wherever has it. Every transfer is sha256-verified. Split out of ensure_models so
+    the same path serves the primary model AND a speculative drafter (passed as a synthetic svc)."""
+    m = svc["model"]
+    missing = [n for n in config.NODES if not model_present(n, m)]
+    missing += _diverged_from_head(m, missing)
+    if not missing:
+        print(f"[ensure] {m}: present on all nodes ✅")
+        return
+    if nas and model_on_nas(m):
+        print(f"[ensure] {m}: found on NAS — replicating to {', '.join(missing)}")
+        for node in missing:
+            _replicate_verified(m, node, source="nas")
+    # nowhere yet -> download. A mounted NAS is always the download target (that's the point
+    # of configuring one); ssh mode can't be mounted into the download container, so it
+    # downloads to the head and archives a copy back to the NAS below.
+    elif nas and _nas_mode(nas) == "path":
+        print(f"[ensure] {m}: downloading to NAS ({nas['path']})")
+        _pull_hf(svc, cache=nas["path"])
+        for node in missing:
+            _replicate_verified(m, node, source="nas")
+    else:
+        if config.HEAD in missing:
+            _pull_hf(svc)                    # verified download on the head
+            missing.remove(config.HEAD)
+            missing += _diverged_from_head(m, missing)   # head is now the reference copy
+        for node in missing:
+            _replicate_verified(m, node, source="head")
+        if nas:
+            push_to_nas(m)
+
+
 def ensure_models(recipe):
-    """`apply`'s pull-if-missing: for each model, check the nodes, then the NAS, then download —
-    replicating from whichever source has the weights. Every transfer is sha256-verified.
-    With no `nas:` configured this reduces to today's head-download + fabric-mirror flow."""
+    """`apply`'s pull-if-missing, per model. Handles each service's primary model plus any
+    speculative drafter (draft_model/EAGLE/DFlash), which must be present on every node too.
+    With no `nas:` configured this reduces to head-download + fabric-mirror."""
     nas = _nas()
     for svc in recipe["services"]:
         provider = svc_provider(svc)
@@ -476,35 +571,16 @@ def ensure_models(recipe):
         if provider != "hf":
             print(f"[ensure] provider '{provider}' unsupported — skipping {svc.get('name')}")
             continue
-        m = svc["model"]
-        missing = [n for n in config.NODES if not model_present(n, m)]
-        if not missing:
-            print(f"[ensure] {m}: present on all nodes ✅")
-            continue
-        if nas and model_on_nas(m):
-            print(f"[ensure] {m}: found on NAS — replicating to {', '.join(missing)}")
-            for node in missing:
-                _replicate_verified(m, node, source="nas")
-        # nowhere yet -> download. A mounted NAS is always the download target (that's the point
-        # of configuring one); ssh mode can't be mounted into the download container, so it
-        # downloads to the head and archives a copy back to the NAS below.
-        elif nas and _nas_mode(nas) == "path":
-            print(f"[ensure] {m}: downloading to NAS ({nas['path']})")
-            _pull_hf(svc, cache=nas["path"])
-            for node in missing:
-                _replicate_verified(m, node, source="nas")
-        else:
-            if config.HEAD in missing:
-                _pull_hf(svc)                    # verified download on the head
-                missing.remove(config.HEAD)
-            for node in missing:
-                _replicate_verified(m, node, source="head")
-            if nas:
-                push_to_nas(m)
+        _ensure_one_hf(svc, nas)
+        draft = speculative_model(svc)
+        if draft:                                # the DFlash/EAGLE drafter needs distributing too
+            _ensure_one_hf({**svc, "model": draft}, nas)
 
     # reclaim stale partials + orphaned blobs left by interrupted/superseded pulls (SAFE: never
-    # touches blobs a live snapshot references). Runs for every hf model in the recipe.
-    for m in {s["model"] for s in recipe["services"] if svc_provider(s) == "hf"}:
+    # touches blobs a live snapshot references). Runs for every hf model (primary + drafter).
+    hf = {s["model"] for s in recipe["services"] if svc_provider(s) == "hf"}
+    hf |= {d for s in recipe["services"] if (d := speculative_model(s))}
+    for m in hf:
         prune_model_cache(m)
 
 

@@ -1,0 +1,42 @@
+# Meta Muse-Glimmer-30B via SGLang + DFlash speculative decoding — the WORKING prefill/spec path.
+# vLLM's DFlash is still broken (PR #51655 unmerged), so SGLang is the correct serving stack for Muse
+# speculative decode (this is exactly why muse-glimmer-30b.yaml keeps its `speculative:` block shelved).
+#
+# TRADEOFF — this config is TEXT-ONLY: DFlash drafts only the language model, so we run
+# --no-enable-multimodal (the ViT vision tower is dropped). Keep muse-glimmer-30b.yaml (vLLM, native
+# muse_glimmer) for IMAGE inputs; use this one for fast text / agentic coding. Both serve the same
+# public name (muse-glimmer-30b) and are mutually exclusive deployments (one `current` at a time).
+#
+# Weights: RadixArk/Muse-Glimmer-NVFP4 (19GB NVFP4) + meta-models/Muse-Glimmer-30B-assistant (DFlash draft).
+# Image: lmsysorg/sglang:dev-muse-glimmer (multi-arch manifest -> arm64 on GB10), declared in
+# cluster.yaml as csv-sglang:muse-glimmer -> `sparkctl apply` auto-pulls it. Adapted from the SGLang
+# DGX Spark recipe (styles01/sparkrun-recipes).
+name: muse-glimmer-30b-sglang
+services:
+- name: agent
+  engine: sglang
+  provider: hf
+  model: RadixArk/Muse-Glimmer-NVFP4
+  served_name: muse-glimmer-30b       # same public name as the vLLM recipe (drop-in for clients)
+  image: csv-sglang:muse-glimmer
+  nodes: [coach, ref]                 # one single-node replica per node -> gateway load-balances
+  port: 8000
+  max_model_len: 131072              # -> --context-length (131k native)
+  trust_remote_code: true
+  tool_call_parser: muse             # SGLang's native muse parsers — note "muse", NOT vLLM's "muse_glimmer"
+  reasoning_parser: muse
+  # DFlash speculative decode. sparkctl translates this to:
+  #   --speculative-algorithm DFLASH --speculative-draft-model-path <repo>
+  #   --speculative-draft-model-quantization fp8
+  # (num-draft-tokens is omitted -> the image's DFlash default, ~15). The drafter auto-downloads +
+  # mirrors to every node via the first-class `speculative:` field.
+  speculative:
+    method: dflash
+    model: meta-models/Muse-Glimmer-30B-assistant
+    draft_quantization: fp8
+  extra_args:                        # SGLang-specific knobs (not cross-engine recipe fields)
+  - --mem-fraction-static 0.38       # weights+KV share this fraction of unified memory (reference value)
+  - --max-running-requests 4         # concurrency cap for the 30B on GB10 (reference value)
+  - --kv-cache-dtype fp8_e4m3        # fp8 KV cache
+  - --no-enable-multimodal           # language-model-only: DFlash drafts the LM, drop the ViT tower
+  - --enable-metrics                 # Prometheus /metrics -> gateway aggregation + Grafana

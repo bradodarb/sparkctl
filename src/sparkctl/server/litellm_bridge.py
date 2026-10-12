@@ -10,6 +10,7 @@ import yaml
 
 from sparkctl import config, secrets
 from sparkctl.backends import get_backend
+from sparkctl.recipes import SERVED_ENGINES
 
 LITELLM_IMAGE = "ghcr.io/berriai/litellm:main-stable"
 LITELLM_LOG = Path.home() / ".sparkctl" / "litellm.log"
@@ -18,14 +19,21 @@ LITELLM_LOG = Path.home() / ".sparkctl" / "litellm.log"
 def litellm_config(recipe, served_from, settings):
     """Turn the backend's endpoint map into a LiteLLM config dict. Services sharing a served_name
     on different nodes become multiple entries with the same model_name -> a load-balance pool."""
+    # served_name -> is-a-VLM, so we can declare vision capability to LiteLLM (its cost/capability map
+    # is keyed by well-known names and won't recognize our custom served_names otherwise).
+    vision = {s.get("served_name", "model"): bool(s.get("multimodal"))
+              for s in recipe.get("services", []) if s.get("engine") in SERVED_ENGINES}
     model_list = []
     for served_name, api_bases in get_backend().endpoints(recipe, served_from).items():
         for base in api_bases:
-            model_list.append({
+            entry = {
                 "model_name": served_name,
                 "litellm_params": {"model": f"openai/{served_name}",
                                    "api_base": base,
-                                   "api_key": "none"}})
+                                   "api_key": "none"}}
+            if vision.get(served_name):
+                entry["model_info"] = {"supports_vision": True}
+            model_list.append(entry)
     cfg = {"model_list": model_list,
            "router_settings": {
                "routing_strategy": settings.get("routing_strategy", "simple-shuffle"),

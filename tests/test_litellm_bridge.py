@@ -65,3 +65,25 @@ def test_router_retries_default_on_and_overridable():
     assert rs["num_retries"] == 2 and rs["cooldown_time"] == 30
     rs = litellm_config(MULTINODE, "local", {"num_retries": 0, "cooldown_time": 5})["router_settings"]
     assert rs["num_retries"] == 0 and rs["cooldown_time"] == 5
+
+
+def test_sglang_service_registered_in_router():
+    # an sglang service is a served OpenAI endpoint -> it must appear in the LiteLLM model_list
+    recipe = {"services": [
+        {"name": "agent", "engine": "sglang", "model": "org/M", "served_name": "muse",
+         "node": config.HEAD, "port": 8000},
+    ]}
+    bym = _by_model(litellm_config(recipe, "local", {}))
+    assert "muse" in bym and bym["muse"][0].endswith(":8000/v1")
+
+
+def test_multimodal_declares_supports_vision():
+    recipe = {"services": [
+        {"name": "vlm", "engine": "vllm", "model": "org/VLM", "served_name": "vlm",
+         "node": config.HEAD, "parallel": {"tensor": 1}, "port": 8000, "multimodal": True},
+        {"name": "txt", "engine": "vllm", "model": "org/T", "served_name": "txt",
+         "node": config.HEAD, "parallel": {"tensor": 1}, "port": 8001},
+    ]}
+    ml = {e["model_name"]: e for e in litellm_config(recipe, "local", {})["model_list"]}
+    assert ml["vlm"].get("model_info") == {"supports_vision": True}
+    assert "model_info" not in ml["txt"]        # text model: no vision claim

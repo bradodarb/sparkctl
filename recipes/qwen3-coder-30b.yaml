@@ -13,24 +13,8 @@ services:
     provider: hf
     model: ig1/Qwen3-Coder-30B-A3B-Instruct-NVFP4
     served_name: qwen3-coder-30b
-    node: coach
-    parallel:
-      tensor: 1                 # single-node serve (no multinode Ray)
-    port: 8000
-    max_model_len: 65536
-    gpu_memory_utilization: 0.80
-    tool_call_parser: qwen3_coder
-    extra_args:
-      - --trust-remote-code
-    env:
-      VLLM_USE_FLASHINFER_MOE_FP4: "1"
-
-  - name: agent-ref
-    engine: vllm
-    provider: hf
-    model: ig1/Qwen3-Coder-30B-A3B-Instruct-NVFP4
-    served_name: qwen3-coder-30b
-    node: ref                   # second independent endpoint at ref:8000
+    nodes: [coach, ref]         # one single-node replica per node (agent-coach / agent-ref),
+                                # same served_name -> gateway load-balances the two endpoints
     parallel:
       tensor: 1                 # single-node serve (no multinode Ray)
     port: 8000
