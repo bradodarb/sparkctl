@@ -64,8 +64,10 @@ open http://localhost:8080/dash            # live status page
 LiteLLM runs as a supervised subprocess — if it crashes, `/metrics` and `/dash` stay up (and vice
 versa), and the server auto-restarts it with capped backoff, so `/v1` heals on its own. Run modes via `server.mode`: **local** (plain process, no Docker — default; deps
 auto-installed into `~/.sparkctl/venv` on first run), **docker** (server container + LiteLLM
-sidecar), **k8s** (roadmap). `server.host` places it on your dev machine (`local`) or a node
-(`serve tunnel` port-forwards to it). The server restarts itself with fresh routes after `apply`.
+sidecar), **k8s** (roadmap). `server.host` places it on your dev machine (`local`), a node, or
+a non-node LAN box declared under `server.hosts` (its own SSH user; routes to the nodes' LAN IPs;
+needs SSH to the nodes for baseline metrics) so several laptops share one gateway (`serve tunnel`
+port-forwards to it). The server restarts itself with fresh routes after `apply`.
 
 **Node baseline metrics** (works even for engines with no metrics endpoint, e.g. Ollama): unified
 memory used/total from `/proc/meminfo` (the honest number on GB10 — `nvidia-smi` memory reads

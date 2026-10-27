@@ -1,0 +1,57 @@
+# Speed variant of qwen3.8-flash-next-tp2 — same NVFP4 checkpoint, image, and TP=2 + EP layout, tuned
+# for 1-3 concurrent sessions and the highest per-stream decode instead of 4-8 long sessions.
+# Everything that kept coach alive in the baseline (engram cpu_offload off, NO fastsafetensors, 0.80
+# memory) is carried over unchanged — see that recipe for the why.
+#
+# Levers, from tonyd2wild's dual-Spark NVFP4 "TP2 SPEED" profile (53.7 tok/s median single stream,
+# 40 prompts; not yet measured here):
+#   - prefill chunk 4096 — reported as "the single biggest lever"
+#   - torch.compile off + FULL_DECODE_ONLY cudagraphs
+#   - MTP3 — A/B'd against MTP4 on the same prompts; 3 won
+#   - few seqs — with <=3 streams the batch never grows enough to dilute per-stream speed
+# Deliberate divergences from that profile: bf16 KV (they ran fp8 for pool size; 3 sessions don't need
+# it and bf16 decodes ~4% faster) and prefix caching ON (they benchmarked with it off; for multi-turn
+# sessions re-prefilling the history costs far more than any decode overhead — A/B it if curious).
+# Their reduced-vocab MTP draft head is a patch, not stock v0.31 — not used here.
+#
+# Same served_name as the baseline, so clients don't change; `apply` one or the other.
+name: qwen3.8-flash-next-tp2-speed
+services:
+- name: flash
+  engine: vllm
+  provider: hf
+  model: nvidia/Qwen3.8-Flash-Next-NVFP4
+  served_name: qwen3.8-flash-next
+  image: csv-vllm:0.31.0
+  parallel:
+    tensor: 2
+  distributed_backend: mp
+  port: 8000
+  max_model_len: 262144                        # KV is no constraint at 3 sessions (~1.3M bf16 tokens)
+  gpu_memory_utilization: 0.80                 # same margin as the baseline until a load is proven
+  tool_call_parser: qwen3_xml
+  reasoning_parser: qwen3
+  speculative:
+    method: mtp
+    num_speculative_tokens: 3
+  extra_args:
+  - "--engram-config='{\"cpu_offload\":false}'"  # see baseline: offload hard-hung coach
+  - --enable-expert-parallel
+  - --max-num-seqs 3                           # the session cap this recipe is tuned for
+  # Eager-mode model + full CUDA graphs for pure-decode steps only (mixed prefill/decode steps run
+  # eager). Skips compile time at startup too. If decode regresses vs the baseline, drop this line
+  # first — vLLM's default (compile + FULL_AND_PIECEWISE) is the fallback.
+  - "--compilation-config='{\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\"}'"
+  - --enable-prefix-caching
+  - --mamba-cache-mode align
+  - --mamba-ssm-cache-dtype bfloat16
+  - --max-num-batched-tokens 4096              # smaller chunks than the baseline's 8192 (see header)
+  # NO fastsafetensors (53.7GB PLE file staged whole on rank 0 -> coach OOM hang). Validate warns.
+  # - --load-format=fastsafetensors
+
+- name: embeddings
+  engine: ollama
+  provider: ollama
+  node: ref
+  model: nomic-embed-text
+  port: 11434

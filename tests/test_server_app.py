@@ -107,3 +107,19 @@ def test_litellm_child_respawns_after_crash(app_env, monkeypatch):
         assert len(procs) >= 2                           # supervisor respawned it
         assert c.get("/healthz").json()["litellm"] == "up"
     assert procs[-1].terminated                          # shutdown still terminates the child
+
+
+@pytest.mark.parametrize("sent,expected", [(None, "identity"), ("gzip", "gzip")])
+def test_v1_proxy_forwards_only_client_accept_encoding(app_env, monkeypatch, sent, expected):
+    import httpx
+    seen = {}
+
+    async def fake_send(self, req, **kw):
+        seen["ae"] = req.headers.get("accept-encoding")
+        return httpx.Response(200, stream=httpx.ByteStream(b"{}"))
+    monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
+    with TestClient(create_app()) as c:
+        c.headers.pop("accept-encoding", None)        # TestClient sends gzip by default; curl doesn't
+        hdrs = {"accept-encoding": sent} if sent else {}
+        c.post("/v1/chat/completions", json={}, headers=hdrs)
+    assert seen["ae"] == expected

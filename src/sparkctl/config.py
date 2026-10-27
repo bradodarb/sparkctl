@@ -54,3 +54,9 @@ DL = CFG.get("download", {})                               # download robustness
 _HOST = socket.gethostname().split(".")[0]
 SELF = next((n for n, v in NODES.items()
              if _HOST == str(v.get("host", n)).split(".")[0] or _HOST == n), None)
+
+# Non-node machines that can host the unified server (server.host may name one): a LAN box that
+# serves the gateway to many laptops. Never a GPU node — no recipes, no serving-node provisioning.
+SERVER_HOSTS = SERVER.get("hosts") or {}
+SERVER_SELF = next((n for n, v in SERVER_HOSTS.items()
+                    if _HOST == str(v.get("host", n)).split(".")[0] or _HOST == n), None)

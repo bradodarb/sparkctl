@@ -139,6 +139,9 @@ def create_app():
     @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
     async def proxy(request: Request, path: str):
         headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP}
+        # bytes pass through raw, so upstream must encode only what the CLIENT accepts — else httpx's
+        # default `accept-encoding: gzip` gets curl/scripts a gzip body they never asked for
+        headers.setdefault("accept-encoding", "identity")
         req = client.build_request(request.method, f"/v1/{path}",
                                    headers=headers, params=request.query_params,
                                    content=request.stream())

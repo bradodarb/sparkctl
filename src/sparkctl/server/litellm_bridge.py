@@ -43,6 +43,9 @@ def litellm_config(recipe, served_from, settings):
                "cooldown_time": settings.get("cooldown_time", 30)}}
     if settings.get("master_key"):
         cfg["general_settings"] = {"master_key": settings["master_key"]}
+    elif settings.get("allow_unauthenticated"):
+        # newer LiteLLM refuses to start keyless; this is the explicit "open LAN gateway" opt-in
+        cfg["general_settings"] = {"dangerously_permit_weak_or_unset_master_key": True}
     return cfg
 
 

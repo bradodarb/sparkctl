@@ -87,3 +87,11 @@ def test_multimodal_declares_supports_vision():
     ml = {e["model_name"]: e for e in litellm_config(recipe, "local", {})["model_list"]}
     assert ml["vlm"].get("model_info") == {"supports_vision": True}
     assert "model_info" not in ml["txt"]        # text model: no vision claim
+
+
+def test_allow_unauthenticated_opts_into_keyless_litellm():
+    cfg = litellm_config(MULTINODE, "local", {"allow_unauthenticated": True})
+    assert cfg["general_settings"] == {"dangerously_permit_weak_or_unset_master_key": True}
+    keyed = litellm_config(MULTINODE, "local", {"master_key": "k", "allow_unauthenticated": True})
+    assert keyed["general_settings"] == {"master_key": "k"}       # a key always wins
+    assert "general_settings" not in litellm_config(MULTINODE, "local", {})

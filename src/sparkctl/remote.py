@@ -36,8 +36,18 @@ def bash(node, script, **kw):
 
 
 def backend_host(node, served_from):
-    """Address a gateway/scraper uses to reach a node's API. From the dev machine ('local') use
-    lan_ip; from a node use the fabric IP (both peers reachable over the fabric)."""
-    if served_from == "local":
+    """Address a gateway/scraper uses to reach a node's API. From the dev machine ('local') or a
+    non-node server host use lan_ip; from a node use the fabric IP (peers reachable over the fabric)."""
+    if served_from not in config.NODES:
         return config.NODES[node].get("lan_ip") or config.NODES[node]["host"]
     return config.NODES[node]["fabric_ip"]
+
+
+def server_host_target(name):
+    """user@addr for a non-node server host (cluster.yaml server.hosts) — its own user, LAN address."""
+    v = config.SERVER_HOSTS[name]
+    return f"{v.get('user', config.USER)}@{v.get('lan_ip') or v.get('host', name)}"
+
+
+def server_host_path(name):
+    return config.SERVER_HOSTS[name].get("remote_path", config.REMOTE)

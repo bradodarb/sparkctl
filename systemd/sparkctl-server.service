@@ -1,5 +1,6 @@
 # Optional: run the unified server (gateway + metrics + dash) at boot on a node.
-# Installed (rendered from cluster.yaml) by `sparkctl deploy --init` when server.host is a node.
+# Installed (rendered from cluster.yaml) by `sparkctl deploy --init` when server.host is a node or a
+# server.hosts entry. Restart=always: `sparkctl serve` restarts it by stopping the process.
 [Unit]
 Description=sparkctl unified server (gateway + metrics + dash)
 Wants=network-online.target
@@ -9,7 +10,7 @@ After=network-online.target
 User={{USER}}
 WorkingDirectory={{REMOTE}}
 ExecStart={{REMOTE}}/bin/sparkctl serve --foreground
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]

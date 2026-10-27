@@ -33,6 +33,7 @@ SRV_IMAGE = f"{config.PFX}-server:latest"
 PROM_NAME, GRAF_NAME = f"{config.PFX}-prometheus", f"{config.PFX}-grafana"
 PROM_IMAGE, GRAF_IMAGE = "prom/prometheus:latest", "grafana/grafana:latest"
 NET = f"{config.PFX}-server-net"
+UNIT = "sparkctl-server.service"
 
 
 def _mode():
@@ -96,7 +97,18 @@ def serve_start(foreground=False, wait=False):
             _wait_healthy()
         return
     port = config.SERVER.get("port", 8080)
+    if not foreground and _unit_active():
+        # the boot unit owns the server here: stopping its process makes systemd (Restart=always)
+        # respawn it with the new recipe — a nohup'd second copy would just fight it for the port
+        serve_stop(quiet=True)
+        print(f"[server] restarted via {UNIT} on :{port} (mode: local)")
+        if wait:
+            _wait_healthy()
+        return
     serve_stop(quiet=True)                 # idempotent restart
+    if foreground:                         # pidfile = this process (execve keeps the pid), so
+        SRV_DIR.mkdir(parents=True, exist_ok=True)    # `serve` restarts / `serve stop` can find it
+        SRV_PID.write_text(f"{os.getpid()}\n")
     # the app supervises a litellm child — make sure the CLI exists somewhere we can find it
     if not (VENV / "bin" / "litellm").exists() and not shutil.which("litellm"):
         _ensure_venv()
@@ -126,6 +138,12 @@ def serve_start(foreground=False, wait=False):
         _wait_healthy()
 
 
+def _unit_active():
+    """True when the boot unit (sparkctl-server.service) is running the server on this machine."""
+    return shutil.which("systemctl") is not None and remote.sh(
+        f"systemctl is-active --quiet {UNIT}", check=False).returncode == 0
+
+
 def serve_stop(quiet=False):
     if SRV_PID.exists():
         remote.sh(f"kill $(cat {SRV_PID}) 2>/dev/null || true", check=False)
@@ -135,6 +153,8 @@ def serve_stop(quiet=False):
               f"{config.PFX}-gateway >/dev/null 2>&1 || true", check=False)
     if not quiet:
         print("[server] down")
+        if _unit_active():
+            print(f"[server] note: {UNIT} will respawn it — `sudo systemctl stop {UNIT}` to keep it down")
 
 
 def serve_status(args=None):
@@ -177,7 +197,9 @@ def serve_tunnel(args=None):
         print(f"server host is 'local' — already at http://localhost:{port}")
         return
     print(f"tunneling http://localhost:{port} -> {host}:{port}  (Ctrl-C to stop)", flush=True)
-    remote.sh(f"ssh -N -L {port}:localhost:{port} {config.USER}@{remote.node_addr(host)}", check=False)
+    target = (remote.server_host_target(host) if host in config.SERVER_HOSTS
+              else f"{config.USER}@{remote.node_addr(host)}")
+    remote.sh(f"ssh -N -L {port}:localhost:{port} {target}", check=False)
 
 
 def server_running():
@@ -192,7 +214,8 @@ def _is_server_host():
     """True if the unified server is meant to run on THIS machine — either server.host is 'local'
     and we're the dev machine (config.SELF is None), or server.host names the node we're on."""
     host = config.SERVER.get("host", "local")
-    return (host == "local" and config.SELF is None) or host == config.SELF
+    return ((host == "local" and config.SELF is None) or host == config.SELF
+            or host == config.SERVER_SELF)
 
 
 def refresh_or_start_server():
@@ -270,7 +293,9 @@ def _grafana_up_if_enabled():
     if config.SELF is None:
         remote.sh(f"docker network inspect {NET} >/dev/null 2>&1 || docker network create {NET}",
                   check=False)
-        net, pmap, gmap = f"--network {NET}", f"-p {pport}:9090", f"-p {gport}:3000"
+        # host-gateway: Docker Desktop resolves host.docker.internal itself; Linux needs the mapping
+        net = f"--network {NET} --add-host=host.docker.internal:host-gateway"
+        pmap, gmap = f"-p {pport}:9090", f"-p {gport}:3000"
         prom_listen, graf_port, ds_url = "9090", "3000", f"http://{PROM_NAME}:9090"
     else:
         net, pmap, gmap = "--network host", "", ""

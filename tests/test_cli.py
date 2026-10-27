@@ -23,6 +23,10 @@ def tmp_root(tmp_path, monkeypatch):
         {"name": "r2", "services": []}))
     (tmp_path / "current").write_text("r1\n")
     monkeypatch.setattr(config, "ROOT", tmp_path)
+    # hermetic regardless of the live cluster.yaml's server placement (no real rsync/ssh)
+    monkeypatch.setitem(config.SERVER, "host", "local")
+    monkeypatch.setattr(config, "SERVER_HOSTS", {})
+    monkeypatch.setattr(config, "SERVER_SELF", None)
     return tmp_path
 
 
@@ -60,6 +64,56 @@ def test_apply_waits_by_default_and_detach_opts_out(tmp_root, monkeypatch):
     main.control_main(["apply", "r2", "--detach"])
     assert calls[0] == ["apply", "r2", "--timeout", "600"]   # default: wait, no --detach forwarded
     assert "--detach" in calls[1]                            # opt-out is forwarded to the head
+
+
+# ---- unified server on a non-node LAN box (server.hosts) ---------------------
+@pytest.fixture
+def lan_server(monkeypatch):
+    monkeypatch.setitem(config.SERVER, "host", "mb")
+    monkeypatch.setattr(config, "SERVER_HOSTS", {"mb": {"lan_ip": "10.0.0.9", "user": "u",
+                                                        "remote_path": "/srv/sparkctl"}})
+    monkeypatch.setattr(config, "SERVER_SELF", None)
+
+
+def test_server_host_target_uses_own_user_and_path(lan_server):
+    assert remote.server_host_target("mb") == "u@10.0.0.9"
+    assert remote.server_host_path("mb") == "/srv/sparkctl"
+
+
+def test_backend_host_from_server_host_uses_lan_ip(lan_server):
+    # a LAN box can't reach the CX7 fabric — it must route to the nodes' LAN addresses
+    assert remote.backend_host(config.HEAD, "mb") == config.NODES[config.HEAD].get(
+        "lan_ip", config.NODES[config.HEAD]["host"])
+
+
+def test_serve_forwards_to_server_host(tmp_root, lan_server, monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "deploy", lambda: calls.append(("deploy",)))
+    monkeypatch.setattr(main, "deploy_server_host", lambda n: calls.append(("deploy_srv", n)))
+    monkeypatch.setattr(main, "run_server_host", lambda n, argv: calls.append(("run", n, argv)))
+    main.control_main(["serve", "status"])
+    assert calls == [("deploy_srv", "mb"), ("run", "mb", ["serve", "status"])]  # nodes untouched
+
+
+def test_apply_restarts_server_on_server_host(tmp_root, lan_server, monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "deploy", lambda: None)
+    monkeypatch.setattr(main, "run_head", lambda argv: 0)
+    monkeypatch.setattr(main, "refresh_or_start_server", lambda: calls.append(("local_refresh",)))
+    monkeypatch.setattr(main, "deploy_server_host", lambda n: calls.append(("deploy_srv", n)))
+    monkeypatch.setattr(main, "run_server_host", lambda n, argv: calls.append(("run", n, argv)))
+    main.control_main(["apply", "r2"])
+    assert calls == [("deploy_srv", "mb"), ("run", "mb", ["serve"])]   # new `current`, then restart
+
+
+def test_serve_runs_locally_on_the_server_host_itself(tmp_root, lan_server, monkeypatch):
+    monkeypatch.setattr(config, "SERVER_SELF", "mb")
+    ran = []
+    monkeypatch.setattr(main, "deploy_server_host", lambda n: pytest.fail("must not self-deploy"))
+    monkeypatch.setattr(main, "build_parser", lambda: SimpleNamespace(
+        parse_args=lambda argv: SimpleNamespace(fn=lambda a: ran.append(argv))))
+    main.control_main(["serve"])
+    assert ran == [["serve"]]
 
 
 # ---- unified server: apply starts it when down (on its host) -----------------

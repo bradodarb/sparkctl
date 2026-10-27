@@ -28,8 +28,15 @@ backend: docker
 #   /healthz  control-plane health          /dash  zero-dependency HTML status page
 server:
   mode: local                     # local (plain process, no Docker — default) | docker | k8s (roadmap)
-  host: local                     # local (dev machine) | a node name — where the server runs
+  host: local                     # local (dev machine) | a node name | a hosts: entry — where it runs
+  # hosts:                        # OPTIONAL non-node machines that can host the server, e.g. a LAN
+  #   appbox:                     # box many laptops share. Own SSH user; reaches nodes via lan_ip.
+  #     lan_ip: 192.168.1.50      # `sparkctl deploy --init` provisions it + installs the boot unit;
+  #     user: me                  # `apply` from any control machine restarts it on the new recipe.
+  #     remote_path: /opt/sparkctl
+  #     allow_from: 192.168.1.0/24  # optional: ufw-allow the server (+grafana) ports from this CIDR
   port: 8080
+  # allow_unauthenticated: true  # keyless gateway; newer LiteLLM refuses to start keyless without it
   routing_strategy: simple-shuffle  # LiteLLM router strategy (e.g. least-busy)
   # num_retries: 2                # retry connection errors on another replica (default 2)
   # cooldown_time: 30             # seconds a failing upstream is benched (default 30)

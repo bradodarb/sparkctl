@@ -48,7 +48,7 @@ services:
   - --enable-expert-parallel                   # NVFP4 routed experts sharded across ranks
   - --max-num-seqs 8                           # session cap: keeps per-stream decode >= ~27 tok/s
   # Prefix caching for the hybrid (GDN + QSA) stack: align mode is required (GDN can't do `all`).
-  # Hits land on mamba-block multiples (~1.6k tokens bf16), so each turn re-prefills at most a block.
+  # Hits land on 832-token block multiples (measured 10-18), so each turn re-prefills at most a block.
   - --enable-prefix-caching
   - --mamba-cache-mode align
   # GDN recurrent state in bf16: halves the ~108MB/session re-read every decode step (bandwidth-bound

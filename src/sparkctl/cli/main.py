@@ -32,7 +32,7 @@ from sparkctl.cli import completion, resource
 from sparkctl.cli.create import cmd_create
 from sparkctl.cli.edit import cmd_edit
 from sparkctl.cli.validate import cmd_validate
-from sparkctl.deploy import deploy, deploy_init
+from sparkctl.deploy import deploy, deploy_init, deploy_server_host
 from sparkctl.distribution import mirror_to_others
 from sparkctl.manifest import verify_deployment, write_active_manifest
 from sparkctl.recipes import current_recipe, load_recipe, recipe_hash
@@ -289,6 +289,13 @@ def run_head(argv):
     return run_node(config.HEAD, argv)
 
 
+def run_server_host(name, argv):
+    r = remote.sh(f"ssh {remote.server_host_target(name)} "
+                  f"{json.dumps(f'{remote.server_host_path(name)}/bin/sparkctl ' + ' '.join(argv))}",
+                  check=False)
+    return r.returncode
+
+
 def launch_pull_queue_on_head(recipes):
     a = remote.node_addr(config.HEAD)
     inner = (f"setsid bash -c 'nohup {config.REMOTE}/bin/sparkctl pull-queue {' '.join(recipes)} "
@@ -312,7 +319,9 @@ def control_main(argv):
     check_removed(argv)
     cmd = argv[0] if argv else "help"
     if cmd == "deploy":
-        return deploy_init() if "--init" in argv else deploy()
+        if "--init" in argv:
+            return deploy_init(server_host_only="--server-host" in argv)
+        return deploy()
     if cmd == "build":
         deploy(); return build(argv[1] if len(argv) > 1 else None)
     if cmd == "pull-queue":
@@ -321,8 +330,11 @@ def control_main(argv):
         a = build_parser().parse_args(argv); return a.fn(a)
     if cmd == "serve":
         srv_host = config.SERVER.get("host", "local")
-        if srv_host == "local" or (len(argv) > 1 and argv[1] in ("config", "tunnel")):
-            a = build_parser().parse_args(argv); return a.fn(a)   # run on the dev machine
+        if (srv_host in ("local", config.SERVER_SELF)
+                or (len(argv) > 1 and argv[1] in ("config", "tunnel"))):
+            a = build_parser().parse_args(argv); return a.fn(a)   # run on this machine
+        if srv_host in config.SERVER_HOSTS:                       # server lives on a LAN box
+            deploy_server_host(srv_host); return run_server_host(srv_host, argv)
         deploy(); return run_node(srv_host, argv)                 # server lives on a node
     if cmd == "apply":
         # resolve -f / name locally (repo is the source of truth), then forward by name
@@ -336,9 +348,13 @@ def control_main(argv):
     if cmd in DEPLOY_VERBS:
         deploy()
     rc = run_head(argv)
-    # keep a dev-machine-local server in sync after a deployment change
-    if cmd == "apply" and config.SERVER.get("host", "local") == "local":
+    # keep a dev-machine-local / LAN-box server in sync after a deployment change
+    srv_host = config.SERVER.get("host", "local")
+    if cmd == "apply" and srv_host in ("local", config.SERVER_SELF):
         refresh_or_start_server()
+    elif cmd == "apply" and srv_host in config.SERVER_HOSTS:
+        deploy_server_host(srv_host)            # ships the new `current`
+        run_server_host(srv_host, ["serve"])    # restart: routes + scrape targets follow the recipe
     if rc:                       # a failed forwarded command (e.g. apply --wait crash) must
         sys.exit(rc)             # propagate — scripts and CI depend on the exit code
 
